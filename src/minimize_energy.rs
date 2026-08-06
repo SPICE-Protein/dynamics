@@ -96,9 +96,12 @@ impl MdState {
         dev: &ComputationDevice,
         external_force: &Option<Vec<Vec3>>,
     ) -> (Vec<Vec3>, f32, f64, Vec<Vec3>, bool) {
-        // We disable long range forces here, as they're slow and not required.
+        // Minimize in the FULL force field (long-range reciprocal INCLUDED). Minimizing with
+        // the reciprocal disabled converges to a state that is not a minimum of the actual
+        // production potential: step 1 of production then sees much larger forces (e.g. max
+        // force ~130 vs ~19 kcal/mol/Å at the end of a recip-off minimization) and the system
+        // drifts into instability within a few steps.
         let prev_recip = self.cfg.overrides.long_range_recip_disabled;
-        self.cfg.overrides.long_range_recip_disabled = true;
 
         // Zero velocities; we’re minimizing, not integrating. Note that accel and force are
         // zeroed downstream.
@@ -172,8 +175,6 @@ impl MdState {
         let mut alpha_try = *alpha;
 
         loop {
-            self.neighbors_nb.max_displacement_sq = 0.0;
-
             // Normalize by the global max force (GROMACS `steep` convention): the highest-force
             // atom moves exactly `step_size`, all others proportionally less. This prevents
             // low-force atoms from over-shooting when a high-force atom is capped at STEP_MAX.
@@ -205,12 +206,16 @@ impl MdState {
                 let s = a.force * (step_size / f_max);
                 a.posit += s;
                 last_step[i] = s;
-
-                self.neighbors_nb.max_displacement_sq = self
-                    .neighbors_nb
-                    .max_displacement_sq
-                    .max(s.magnitude_squared());
             }
+
+            // Track cumulative displacement since the last neighbor rebuild (not just this
+            // iteration's step size), so `build_neighbors_if_needed` keeps the pair list valid
+            // as atoms move. Previously this reset to 0.0 each iteration and tracked only the
+            // single-step displacement, so the neighbor list was built once at min start and
+            // never refreshed — missing close pairs that emerged during relaxation. That made
+            // the minimizer "converge" on a stale force field while production (which does
+            // track cumulative displacement) suddenly saw much larger forces on step 1.
+            self.update_max_displacement_since_rebuild();
 
             self.build_neighbors_if_needed(dev);
 
@@ -231,13 +236,10 @@ impl MdState {
             }
 
             // Reject: revert positions
-            let mut max_revert_sq = 0.0f32;
             for (i, a) in self.atoms.iter_mut().enumerate() {
                 let s = last_step[i];
-                let s2 = s.magnitude_squared();
-                if s2 > 0.0 {
+                if s.magnitude_squared() > 0.0 {
                     a.posit -= s;
-                    max_revert_sq = max_revert_sq.max(s2);
                 }
             }
 
@@ -245,14 +247,14 @@ impl MdState {
 
             if alpha_try < ALPHA_MIN {
                 *alpha = alpha_try;
-                self.neighbors_nb.max_displacement_sq = max_revert_sq;
+                self.update_max_displacement_since_rebuild();
                 self.build_neighbors_if_needed(dev);
                 compute_forces_and_energy(self, dev, external_force);
                 return true;
             }
 
             // Ensure neighbors/forces are valid at the reverted geometry, then retry with smaller alpha_try
-            self.neighbors_nb.max_displacement_sq = max_revert_sq;
+            self.update_max_displacement_since_rebuild();
             self.build_neighbors_if_needed(dev);
             compute_forces_and_energy(self, dev, external_force);
         }

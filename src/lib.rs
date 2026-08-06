@@ -175,11 +175,12 @@ use crate::{
     params::FfParamSet,
     snapshot::Snapshot,
     solvent::{
-        WaterMolx8, WaterMolx16, init::water_mols_from_template_in_region_avoiding,
-        octanol::octanol_mols_from_gro,
+        init::water_mols_from_template_in_region_avoiding, octanol::octanol_mols_from_gro,
     },
     util::{ComputationTime, ComputationTimeSums, build_adjacency_list},
 };
+#[cfg(target_arch = "x86_64")]
+use crate::solvent::{WaterMolx16, WaterMolx8};
 pub use crate::{
     barostat::{BarostatCfg, PRESSURE_DEFAULT, TAU_PRESSURE_DEFAULT},
     solvent::octanol::make_octanol,
@@ -199,6 +200,8 @@ const KCAL_TO_NATIVE: f32 = 418.4;
 // energy, for example. This, in practice, is for temperature and pressure computations.
 // Converts *out of * our internal units.
 const NATIVE_TO_KCAL: f32 = 1. / KCAL_TO_NATIVE;
+// Avogadro constant, for converting molarity -> ion counts.
+const AVOGADRO: f64 = 6.02214076e23;
 
 // Every this many steps, re-center the sim (solvent) box.
 const CENTER_SIMBOX_RATIO: usize = 30;
@@ -1043,14 +1046,25 @@ impl MdState {
             Solvent::Custom(_) => Vec::new(), // todo: ?
         };
 
+        let mut n_ions_total = n_ions;
         if !cfg.overrides.skip_counterion_insertion {
             add_ions(&mut result, net_q_e, n_ions);
+        }
+
+        // SPICE: add salt (Na⁺/Cl⁻ pairs) to reach the target ionic strength.
+        if let Some(conc_m) = cfg.salt_concentration_m {
+            if conc_m > 0.0 {
+                let vol_l = f64::from(result.cell.volume()) * 1.0e-27;
+                let n_pairs = ((f64::from(conc_m)) * vol_l * AVOGADRO).round() as usize;
+                n_ions_total += 2 * n_pairs;
+                result.add_salt_ions(n_pairs);
+            }
         }
         validate_mol_start_indices(result.atoms.len(), &result.mol_start_indices)
             .map_err(|e| ParamError::new(&e))?;
 
         // Rebuild the LJ table to include any ions that were appended after the initial build.
-        if n_ions > 0 {
+        if n_ions_total > 0 {
             result.lj_tables = LjTables::new(&result.atoms);
         }
 
@@ -1567,72 +1581,82 @@ pub(crate) fn validate_mol_start_indices(
     Ok(())
 }
 
+/// Add one ion atom by displacing the water molecule at `w_idx` (does NOT remove the
+/// water; the caller must remove all displaced waters afterwards, in descending order).
+/// Joung–Cheatham parameters tuned for OPC water (Amber frcmod.ionsjc_opc).
+fn insert_ion(
+    state: &mut MdState,
+    w_idx: usize,
+    ff_type: &str,
+    elem: Element,
+    mass: f32,
+    q: f32,
+    sigma: f32,
+    eps: f32,
+) {
+    let atom_idx = state.atoms.len();
+    let posit = state.water[w_idx].o.posit;
+
+    state.atoms.push(AtomDynamics {
+        serial_number: atom_idx as u32,
+        force_field_type: ff_type.to_string(),
+        element: elem,
+        posit,
+        mass,
+        partial_charge: q,
+        lj_sigma: sigma,
+        lj_eps: eps,
+        ..Default::default()
+    });
+    state.force_field_params.mass.insert(
+        atom_idx,
+        MassParams {
+            atom_type: ff_type.to_string(),
+            mass,
+            comment: None,
+        },
+    );
+    state.force_field_params.lennard_jones.insert(
+        atom_idx,
+        LjParams {
+            atom_type: ff_type.to_string(),
+            sigma,
+            eps,
+        },
+    );
+    state.adjacency_list.push(Vec::new());
+    state.mass_accel_factor.push(KCAL_TO_NATIVE / mass);
+    state.mol_start_indices.push(atom_idx);
+}
+
+/// Remove displaced water molecules. Indices may be in any order; they are deduplicated
+/// and removed from highest to lowest to avoid index shifting.
+fn remove_waters(state: &mut MdState, mut w_indices: Vec<usize>) {
+    w_indices.sort_unstable_by(|a, b| b.cmp(a));
+    w_indices.dedup();
+    for idx in w_indices {
+        state.water.remove(idx);
+    }
+}
+
 fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
     // Add counter-ions to neutralize any net charge.
-    // Joung–Cheatham parameters tuned for OPC water (Amber frcmod.ionsjc_opc).
-    // sigma = 2 * R_MIN_HALF / 2^(1/6)
+    // Positive net → add Cl⁻;  negative net → add Na⁺.
     if n_ions > 0 && !state.water.is_empty() {
-        // Positive net → add Cl⁻;  negative net → add Na⁺.
         let (ff_type, elem, mass, q_scaled, sigma, eps): (&str, Element, f32, f32, f32, f32) =
             if net_q_e > 0.0 {
-                (
-                    "Cl-",
-                    Element::Chlorine,
-                    35.45,
-                    -CHARGE_UNIT_SCALER,
-                    4.478,
-                    0.0073,
-                )
+                ("Cl-", Element::Chlorine, 35.45, -CHARGE_UNIT_SCALER, 4.478, 0.0073)
             } else {
-                (
-                    "Na+",
-                    Element::Sodium,
-                    22.99,
-                    CHARGE_UNIT_SCALER,
-                    2.439,
-                    0.1065,
-                )
+                ("Na+", Element::Sodium, 22.99, CHARGE_UNIT_SCALER, 2.439, 0.1065)
             };
 
         let stride = (state.water.len() / n_ions).max(1);
-        let mut water_to_remove: Vec<usize> = (0..n_ions)
+        let w_indices: Vec<usize> = (0..n_ions)
             .map(|i| (i * stride).min(state.water.len() - 1))
             .collect();
 
-        for &w_idx in &water_to_remove {
-            let atom_idx = state.atoms.len();
-            let posit = state.water[w_idx].o.posit;
-
-            state.atoms.push(AtomDynamics {
-                serial_number: atom_idx as u32,
-                force_field_type: ff_type.to_string(),
-                element: elem,
-                posit,
-                mass,
-                partial_charge: q_scaled,
-                lj_sigma: sigma,
-                lj_eps: eps,
-                ..Default::default()
-            });
-            state.force_field_params.mass.insert(
-                atom_idx,
-                MassParams {
-                    atom_type: ff_type.to_string(),
-                    mass,
-                    comment: None,
-                },
-            );
-            state.force_field_params.lennard_jones.insert(
-                atom_idx,
-                LjParams {
-                    atom_type: ff_type.to_string(),
-                    sigma,
-                    eps,
-                },
-            );
-            state.adjacency_list.push(Vec::new());
-            state.mass_accel_factor.push(KCAL_TO_NATIVE / mass);
-            state.mol_start_indices.push(atom_idx);
+        for &w_idx in &w_indices {
+            insert_ion(state, w_idx, ff_type, elem, mass, q_scaled, sigma, eps);
         }
         // Expand per-mol energy tracking for the new ion "molecules".
         let n_mols = state.mol_start_indices.len();
@@ -1640,12 +1664,7 @@ fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
             .potential_energy_between_mols
             .resize(n_mols.pow(2), 0.0);
 
-        // Remove displaced water molecules (in reverse index order).
-        water_to_remove.sort_unstable_by(|a, b| b.cmp(a));
-        water_to_remove.dedup();
-        for idx in water_to_remove {
-            state.water.remove(idx);
-        }
+        remove_waters(state, w_indices);
 
         eprintln!(
             "Added {n_ions} {} ion(s) to neutralize net charge ({net_q_e:+.3}e).",
@@ -1656,5 +1675,47 @@ fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
             "Warning: net charge {net_q_e:+.3}e detected but no solvent available to \
                  displace; skipping ion insertion."
         );
+    }
+}
+
+impl MdState {
+    /// Add `n_pairs` Na⁺/Cl⁻ ion pairs to reach a target ionic strength, each pair
+    /// displacing a water molecule. Rebuilds the LJ tables and thermo DOF so the new
+    /// ions are fully accounted for. Safe to call again later (e.g. to change salt).
+    pub fn add_salt_ions(&mut self, n_pairs: usize) {
+        if n_pairs == 0 || self.water.is_empty() {
+            return;
+        }
+
+        let (na_ff, na_elem, na_mass, na_q, na_sig, na_eps):
+            (&str, Element, f32, f32, f32, f32) =
+            ("Na+", Element::Sodium, 22.99, CHARGE_UNIT_SCALER, 2.439, 0.1065);
+        let (cl_ff, cl_elem, cl_mass, cl_q, cl_sig, cl_eps):
+            (&str, Element, f32, f32, f32, f32) =
+            ("Cl-", Element::Chlorine, 35.45, -CHARGE_UNIT_SCALER, 4.478, 0.0073);
+
+        let total = 2 * n_pairs;
+        let stride = (self.water.len() / total).max(1);
+        let w_indices: Vec<usize> = (0..total)
+            .map(|i| (i * stride).min(self.water.len() - 1))
+            .collect();
+
+        for (k, &w_idx) in w_indices.iter().enumerate() {
+            let (ff, elem, mass, q, sig, eps) = if k % 2 == 0 {
+                (na_ff, na_elem, na_mass, na_q, na_sig, na_eps)
+            } else {
+                (cl_ff, cl_elem, cl_mass, cl_q, cl_sig, cl_eps)
+            };
+            insert_ion(self, w_idx, ff, elem, mass, q, sig, eps);
+        }
+        remove_waters(self, w_indices);
+
+        // Expand per-mol energy tracking for the new ion "molecules".
+        let n_mols = self.mol_start_indices.len();
+        self.potential_energy_between_mols.resize(n_mols.pow(2), 0.0);
+
+        self.lj_tables = LjTables::new(&self.atoms);
+        self.thermo_dof = self.dof_for_thermo();
+        eprintln!("Added {n_pairs} Na⁺/Cl⁻ pair(s) for ionic strength.");
     }
 }

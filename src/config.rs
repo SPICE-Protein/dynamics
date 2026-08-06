@@ -103,6 +103,9 @@ pub struct MdConfig {
     /// If enabled, keep the cell centered on the dynamic atoms at init and during the run.
     /// Disable this for pulling / driven systems where you want the box to remain fixed.
     pub recenter_sim_box: bool,
+    /// Target salt (NaCl) concentration in mol/L added at init, to control ionic
+    /// strength. `None` (default) adds no salt beyond charge neutralization.
+    pub salt_concentration_m: Option<f32>,
     pub overrides: MdOverrides,
 }
 
@@ -134,6 +137,7 @@ impl Default for MdConfig {
             coulomb_cutoff: 10.,
             lj_cutoff: 10.,
             recenter_sim_box: true,
+            salt_concentration_m: None,
             overrides: Default::default(),
         }
     }
@@ -349,6 +353,7 @@ impl From<MdpParams> for MdConfig {
             coulomb_cutoff: p.rcoulomb * NM_TO_ANGSTROM,
             lj_cutoff: p.rvdw * NM_TO_ANGSTROM,
             recenter_sim_box: def.recenter_sim_box,
+            salt_concentration_m: None,
         }
     }
 }

@@ -423,6 +423,32 @@ pub fn prepare_peptide_mmcif(
 ) -> Result<(Vec<BondGeneric>, Vec<Dihedral>), ParamError> {
     let mut dihedrals = Vec::new();
 
+    // Drop hetero atoms (water, ions, ligands) up front. `MdState::new` filters
+    // `!hetero` atoms for peptides, so bonds must be created on the same atom set
+    // or the serial-number lookup in `build_adjacency_list` fails.
+    let hetero_sns: std::collections::HashSet<u32> = mol
+        .atoms
+        .iter()
+        .filter(|a| a.hetero)
+        .map(|a| a.serial_number)
+        .collect();
+    if !hetero_sns.is_empty() {
+        mol.atoms.retain(|a| !a.hetero);
+        // Drop residues/water whose atoms were all removed; fix refs of the rest.
+        mol.residues
+            .retain(|r| r.atom_sns.iter().any(|sn| !hetero_sns.contains(sn)));
+        for res in &mut mol.residues {
+            res.atom_sns.retain(|sn| !hetero_sns.contains(sn));
+        }
+        // Update chain atom/residue references.
+        let keep_res: std::collections::HashSet<u32> =
+            mol.residues.iter().map(|r| r.serial_number).collect();
+        for ch in &mut mol.chains {
+            ch.atom_sns.retain(|sn| !hetero_sns.contains(sn));
+            ch.residue_sns.retain(|sn| keep_res.contains(sn));
+        }
+    }
+
     let h_count = mol
         .atoms
         .iter()
@@ -442,6 +468,88 @@ pub fn prepare_peptide_mmcif(
     populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map)?;
 
     let bonds = create_bonds(&mol.atoms);
+    // Distance-based bond inference creates spurious cross-residue bonds in
+    // folded proteins (e.g. CB of residue i close to NH1 of residue i+3).
+    // Keep only physically sensible bonds: intra-residue, backbone peptide
+    // bonds C(i)-N(i+1), and Cys-Cys disulfides.
+    let bonds = filter_protein_bonds(&mol.atoms, &mol.residues, bonds);
 
     Ok((bonds, dihedrals))
+}
+
+/// Filter distance-inferred bonds to a physically sensible protein bond set.
+///
+/// `create_bonds` infers bonds from inter-atomic distance + element pairs, which
+/// is fine for isolated small molecules but wrong for folded proteins: two atoms
+/// from distant residues can sit within covalent-bond distance and get a spurious
+/// "bond". We therefore keep only:
+///   1. intra-residue bonds (both atoms in the same residue),
+///   2. backbone peptide bonds C(i)-N(i+1) between consecutive residues,
+///   3. Cys-Cys disulfide bridges (SG-SG).
+fn filter_protein_bonds(
+    atoms: &[AtomGeneric],
+    residues: &[ResidueGeneric],
+    bonds: Vec<BondGeneric>,
+) -> Vec<BondGeneric> {
+    use AtomTypeInRes::*;
+
+    let mut atom_idx: HashMap<u32, usize> = HashMap::new();
+    for (i, a) in atoms.iter().enumerate() {
+        atom_idx.insert(a.serial_number, i);
+    }
+    let mut res_by_sn: HashMap<u32, usize> = HashMap::new();
+    for (ri, res) in residues.iter().enumerate() {
+        for sn in &res.atom_sns {
+            res_by_sn.insert(*sn, ri);
+        }
+    }
+    // Peptide order (residues may be stored in any order).
+    let mut order: Vec<usize> = (0..residues.len()).collect();
+    order.sort_by_key(|&i| residues[i].serial_number);
+    let mut res_pos: HashMap<usize, usize> = HashMap::new();
+    for (pos, &ri) in order.iter().enumerate() {
+        res_pos.insert(ri, pos);
+    }
+
+    let is_sg = |a: &AtomGeneric| matches!(a.type_in_res, Some(SG));
+
+    bonds
+        .into_iter()
+        .filter(|b| {
+            let (Some(&i0), Some(&i1)) =
+                (atom_idx.get(&b.atom_0_sn), atom_idx.get(&b.atom_1_sn))
+            else {
+                return false;
+            };
+            let (Some(&r0), Some(&r1)) =
+                (res_by_sn.get(&b.atom_0_sn), res_by_sn.get(&b.atom_1_sn))
+            else {
+                return false;
+            };
+
+            if r0 == r1 {
+                return true; // intra-residue
+            }
+
+            // Cross-residue bonds must be a disulfide or a backbone peptide bond.
+            if is_sg(&atoms[i0]) && is_sg(&atoms[i1]) {
+                return true; // Cys-Cys disulfide
+            }
+
+            let (Some(&p0), Some(&p1)) = (res_pos.get(&r0), res_pos.get(&r1)) else {
+                return false;
+            };
+            if p0.abs_diff(p1) != 1 {
+                return false;
+            }
+            let (earlier, later) = if p0 < p1 { (r0, r1) } else { (r1, r0) };
+            if residues[earlier].end == ResidueEnd::CTerminus
+                || residues[later].end == ResidueEnd::NTerminus
+            {
+                return false; // chain break
+            }
+            let (c_idx, n_idx) = if p0 < p1 { (i0, i1) } else { (i1, i0) };
+            atoms[c_idx].type_in_res == Some(C) && atoms[n_idx].type_in_res == Some(N)
+        })
+        .collect()
 }

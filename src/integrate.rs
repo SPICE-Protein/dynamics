@@ -513,6 +513,14 @@ impl MdState {
     /// Half kick for non-solvent and solvent. We call this one or more time
     /// in the various integration approaches. Updates kinetic energy.
     fn kick_and_calc_accel(&mut self, dt: f32) {
+        // Rate-limit the clamp diagnostics: print once per step with a count,
+        // instead of one line per atom — otherwise the log floods when many
+        // atoms hit the bound (e.g. during stability scans at non-physiological
+        // conditions).
+        let mut clamped_count = 0usize;
+        let mut clamped_first = 0usize;
+        let mut clamped_mag = 0.0f32;
+
         for (i, a) in self.atoms.iter_mut().enumerate() {
             if a.static_ {
                 continue;
@@ -520,21 +528,24 @@ impl MdState {
 
             a.accel = a.force * self.mass_accel_factor[i];
             if a.accel.magnitude_squared() > MAX_ACCEL_SQ {
-                if !(self.solvent_only_sim_at_init && self.cfg.solvent == Solvent::OctanolWithWater)
-                {
-                    println!(
-                        "Error: Acceleration out of bounds for atom {} on step {}. Clamping {:.3} to {:.3}",
-                        i,
-                        self.step_count,
-                        a.accel.magnitude(),
-                        MAX_ACCEL
-                    );
+                if clamped_count == 0 {
+                    clamped_first = i;
+                    clamped_mag = a.accel.magnitude();
                 }
-
+                clamped_count += 1;
                 a.accel = a.accel.to_normalized() * MAX_ACCEL;
             }
 
             a.vel += a.accel * dt;
+        }
+
+        if clamped_count > 0
+            && !(self.solvent_only_sim_at_init && self.cfg.solvent == Solvent::OctanolWithWater)
+        {
+            println!(
+                "Warn: {clamped_count} atom(s) hit accel clamp on step {}, first atom {clamped_first} ({clamped_mag:.0} -> {MAX_ACCEL:.0})",
+                self.step_count
+            );
         }
 
         for w in &mut self.water {

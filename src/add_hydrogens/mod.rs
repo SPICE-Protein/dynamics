@@ -9,10 +9,12 @@
 //!
 //! This page has atom labels for all AAs; use it as a ref and QC: https://ccpn.ac.uk/manual/v3/NEFAtomNames.html
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bio_files::{AtomGeneric, ChainGeneric, ResidueGeneric};
-use na_seq::{AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes};
+use na_seq::{
+    AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes, Element,
+};
 
 use crate::{
     ParamError,
@@ -389,6 +391,116 @@ pub(crate) fn h_type_in_res_sidechain(
 ///
 /// Returns dihedrals.
 /// todo: This needs to add bonds too!
+/// Resolve hard clashes introduced by idealized H placement.
+///
+/// The H-placement uses ideal per-residue geometry without checking the rest of
+/// the (folded) protein, so in tightly packed regions an added H can sit ~1 Å from
+/// a non-bonded atom of another residue and blow the system up within a few MD
+/// steps; energy minimization cannot always push them apart (bonded forces pin
+/// the H's). We remove any added H that is within `CLASH_DIST` of an atom outside
+/// its own residue. Same-residue atoms are excluded from the check: they are
+/// 1-2/1-3 bonded (or template-adjacent) and legitimately close.
+///
+/// Returns the number of H's removed.
+fn resolve_h_clashes(
+    atoms: &mut Vec<AtomGeneric>,
+    residues: &mut [ResidueGeneric],
+    chains: &mut [ChainGeneric],
+    new_sn_start: u32,
+) -> usize {
+    const CLASH_DIST: f64 = 1.2; // Å — clearly-overlapping non-bonded contact
+    const PARENT_DIST: f64 = 1.55; // Å — longest heavy-H bond (S-H ~1.35 Å)
+
+    // serial -> residue index, and residue index -> set of atom serials
+    let mut res_of: HashMap<u32, usize> = HashMap::new();
+    let mut res_atoms: Vec<HashSet<u32>> = Vec::with_capacity(residues.len());
+    for (ri, res) in residues.iter().enumerate() {
+        let set: HashSet<u32> = res.atom_sns.iter().copied().collect();
+        for sn in &set {
+            res_of.insert(*sn, ri);
+        }
+        res_atoms.push(set);
+    }
+
+    // serial -> index for fast lookup
+    let mut idx_of: HashMap<u32, usize> = HashMap::new();
+    for (i, a) in atoms.iter().enumerate() {
+        idx_of.insert(a.serial_number, i);
+    }
+
+    let h_serials: Vec<u32> = atoms
+        .iter()
+        .filter(|a| a.serial_number >= new_sn_start)
+        .map(|a| a.serial_number)
+        .collect();
+
+    let mut to_remove: HashSet<u32> = HashSet::new();
+
+    for &sn in &h_serials {
+        let Some(&hi) = idx_of.get(&sn) else {
+            continue;
+        };
+        let h_pos = atoms[hi].posit;
+
+        // parent = nearest heavy atom within PARENT_DIST
+        let mut parent_sn: Option<u32> = None;
+        let mut best = PARENT_DIST;
+        for (j, a) in atoms.iter().enumerate() {
+            if j == hi || a.element == Element::Hydrogen {
+                continue;
+            }
+            let d = (a.posit - h_pos).magnitude();
+            if d < best {
+                best = d;
+                parent_sn = Some(a.serial_number);
+            }
+        }
+        let Some(psn) = parent_sn else { continue };
+        let Some(&pri) = res_of.get(&psn) else { continue };
+        let excluded = &res_atoms[pri];
+
+        // min distance to a non-excluded atom
+        let mut min_d = f64::INFINITY;
+        for (j, a) in atoms.iter().enumerate() {
+            if j == hi || excluded.contains(&a.serial_number) {
+                continue;
+            }
+            let d = (a.posit - h_pos).magnitude();
+            if d < min_d {
+                min_d = d;
+            }
+        }
+
+        if min_d < CLASH_DIST {
+            to_remove.insert(sn);
+        }
+    }
+
+    // Remove marked atoms (descending index), clean residue/chain refs.
+    let mut idxs: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| to_remove.contains(&a.serial_number))
+        .map(|(i, _)| i)
+        .collect();
+    idxs.sort_unstable_by(|a, b| b.cmp(a));
+    for i in idxs {
+        atoms.remove(i);
+    }
+    for res in residues.iter_mut() {
+        res.atom_sns.retain(|sn| !to_remove.contains(sn));
+    }
+    for ch in chains.iter_mut() {
+        ch.atom_sns.retain(|sn| !to_remove.contains(sn));
+    }
+
+    let n = to_remove.len();
+    if n > 0 {
+        eprintln!("Removed {n} H(s) to resolve clashes.");
+    }
+    n
+}
+
 pub fn populate_hydrogens_dihedrals(
     atoms: &mut Vec<AtomGeneric>,
     residues: &mut [ResidueGeneric],
@@ -493,6 +605,11 @@ pub fn populate_hydrogens_dihedrals(
         // res.dihedral = Some(dihedral);
         dihedrals.push(dihedral);
     }
+
+    // Resolve clashes introduced by idealized H placement: an H can sit < 1.2 Å
+    // from an atom of another residue in a folded protein and blow the system up
+    // within a few MD steps.
+    resolve_h_clashes(atoms, residues, chains, highest_sn + 1);
 
     Ok(dihedrals)
 }

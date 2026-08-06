@@ -446,6 +446,7 @@ impl MdState {
         let (f_on_non_water, f_on_water, virial, energy, energy_between_mols, alch_dh_dl) =
             match dev {
                 ComputationDevice::Cpu => {
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     if is_x86_feature_detected!("avx512f") {
                         // calc_force_x16(
                         //     &self.nb_pairs,

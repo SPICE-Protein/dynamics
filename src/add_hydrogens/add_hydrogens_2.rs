@@ -280,11 +280,21 @@ fn add_h_sc_het(
                         let mut planar = false;
                         let mut exemption = false;
                         if let Some(a) = aa {
-                            // Ring overrides, changing from 2 H in tetra to 1 in planar config.
-                            // todo: In the case of His, thsi might depend on the protonation state.
-                            if (a == AminoAcid::Trp && *parent_tir == AtomTypeInRes::CD1)
-                                || (a == AminoAcid::His && *parent_tir == AtomTypeInRes::CD2)
-                            {
+                            // Ring overrides: aromatic CH carbons always carry exactly one
+                            // H in a planar config, regardless of how the crystal geometry
+                            // deforms the ring. A pure bond-angle threshold (2.00 rad) sits
+                            // between sp3 (~109.5°) and sp2 (~120°); a distorted aromatic ring
+                            // can dip below it and be misclassified as tetrahedral, adding a
+                            // spurious second H (e.g. Trp CZ2 -> fake HA-CA-HA angle).
+                            use AtomTypeInRes::*;
+                            let aromatic_ch = match a {
+                                AminoAcid::Phe => matches!(parent_tir, CD1 | CD2 | CE1 | CE2 | CZ),
+                                AminoAcid::Tyr => matches!(parent_tir, CD1 | CD2 | CE1 | CE2),
+                                AminoAcid::Trp => matches!(parent_tir, CD1 | CE3 | CZ2 | CZ3),
+                                AminoAcid::His => matches!(parent_tir, CG | CD2 | CE1),
+                                _ => false,
+                            };
+                            if aromatic_ch {
                                 exemption = true;
                             }
                         }
@@ -421,6 +431,11 @@ fn add_h_sc_het(
                         // NH2 (2 H, planar) only above the LYS pKa (LYN variant).
                         // All other terminal nitrogens (ARG NH1/NH2, ASN ND2, GLN NE2) are
                         // always NH2 (2 H, planar).
+                        //
+                        // NOTE: `digit_map` keys by the FIRST designator char, so ARG's
+                        // NH1 (HH11/HH12) and NH2 (HH21/HH22) collide under 'H' (4 digits),
+                        // which would spuriously trigger the NH3+ branch (3 H) below.
+                        // Arg guanidinium has no pH variant — NH1/NH2 always carry 2 H.
                         let depth = match parent_tir {
                             AtomTypeInRes::NZ => 'Z',
                             AtomTypeInRes::NH1 | AtomTypeInRes::NH2 => 'H',
@@ -428,11 +443,14 @@ fn add_h_sc_het(
                             AtomTypeInRes::ND1 | AtomTypeInRes::ND2 => 'D',
                             _ => '\0',
                         };
-                        let n_h = aa
-                            .and_then(|a| digit_map.get(&a))
-                            .and_then(|m| m.get(&depth))
-                            .map(|d| d.len())
-                            .unwrap_or(2);
+                        let n_h = if matches!(parent_tir, AtomTypeInRes::NH1 | AtomTypeInRes::NH2) {
+                            2 // ARG guanidinium: always NH2 (2 H)
+                        } else {
+                            aa.and_then(|a| digit_map.get(&a))
+                                .and_then(|m| m.get(&depth))
+                                .map(|d| d.len())
+                                .unwrap_or(2)
+                        };
 
                         if n_h >= 3 {
                             // NH3+ ammonium: tetrahedral geometry, 3 H (e.g. LYS NZ)
