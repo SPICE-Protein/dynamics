@@ -11,7 +11,8 @@ use std::fmt::Display;
 
 use bincode::{Decode, Encode};
 use lin_alg::f32::Vec3;
-use rand::prelude::ThreadRng;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::{
@@ -309,14 +310,21 @@ impl Display for Virial {
 /// correct NpT fluctuations that Berendsen suppresses.
 pub struct Barostat {
     pub virial: Virial,
-    pub rng: ThreadRng,
+    /// C-rescale uses a Gaussian; `StdRng` (rather than the thread-local RNG) so that
+    /// `MdState` is `Send` and engine pools can run workers in parallel.
+    pub rng: StdRng,
 }
 
 impl Default for Barostat {
     fn default() -> Self {
         Self {
             virial: Default::default(),
-            rng: rand::rng(),
+            rng: StdRng::seed_from_u64(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            ),
         }
     }
 }
