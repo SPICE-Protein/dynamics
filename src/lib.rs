@@ -1310,10 +1310,6 @@ impl MdState {
         let mut start = Instant::now();
         let log_time = self.step_count.is_multiple_of(COMPUTATION_TIME_RATIO);
 
-        if log_time {
-            start = Instant::now();
-        }
-
         if !self.cfg.overrides.bonded_disabled {
             self.apply_bonded_forces();
         }

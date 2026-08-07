@@ -9,7 +9,6 @@
 use std::time::Instant;
 
 use lin_alg::f32::Vec3;
-use rayon::prelude::*;
 
 #[cfg(feature = "cuda")]
 use crate::gpu_interface::PerNeighborGpu;
@@ -186,96 +185,108 @@ pub fn build_neighbors(
     symmetric: bool,
     skin_sq_w_cutoff: f32,
 ) -> Vec<Vec<usize>> {
-    let outer_len = posits_outer.len();
-    let inner_len = posits_inner.len();
-
     if is_static.is_some() && !symmetric {
         panic!("Invalid neighbor build config; can't pass static indices if non-symmetric.")
     }
-
     if symmetric {
         assert_eq!(
-            inner_len, outer_len,
+            posits_inner.len(),
+            posits_outer.len(),
             "symmetric=true requires identical sets"
         );
-        let n = outer_len;
-
-        let half: Vec<Vec<usize>> = (0..n)
-            .into_par_iter()
-            .map(|i_outer| {
-                let mut out = Vec::new();
-                let posit_tgt = posits_outer[i_outer];
-                for i_inner in (i_outer + 1)..n {
-                    // Skip this computation for static-static. Note that we have downstream
-                    // ways to prevent the actual NB computations between static-static.
-                    let mut st_st = false;
-
-                    if let Some(st) = is_static
-                        && st[i_outer]
-                        && st[i_inner]
-                    {
-                        st_st = true;
-                    }
-
-                    if !st_st {
-                        let d = cell.min_image(posit_tgt - posits_inner[i_inner]);
-                        if d.magnitude_squared() < skin_sq_w_cutoff {
-                            out.push(i_inner);
-                        }
-                    }
-                }
-                out
-            })
-            .collect();
-
-        // Compute exact degrees for each node
-        let mut deg = vec![0; n];
-        for i in 0..n {
-            deg[i] += half[i].len();
-            for &j in &half[i] {
-                deg[j] += 1;
-            }
-        }
-
-        let mut full: Vec<Vec<usize>> = (0..n).map(|i| Vec::with_capacity(deg[i])).collect();
-
-        for i in 0..n {
-            for &j in &half[i] {
-                full[i].push(j);
-                full[j].push(i);
-            }
-        }
-        full
-    } else {
-        (0..outer_len)
-            .into_par_iter()
-            .map(|i_outer| {
-                let mut out = Vec::new();
-                let pos_outer = posits_outer[i_outer];
-
-                for i_inner in 0..inner_len {
-                    // Skip this computation for static-static. Note that we have downstream
-                    // ways to prevent the actual NB computations between static-static.
-                    let mut st_st = false;
-
-                    if let Some(st) = is_static
-                        && st[i_outer]
-                        && st[i_inner]
-                    {
-                        st_st = true;
-                    }
-
-                    if !st_st {
-                        let pos_inner = posits_inner[i_inner];
-                        // todo: Only take the min image for solvent?
-                        let d = cell.min_image(pos_outer - pos_inner);
-                        if d.magnitude_squared() < skin_sq_w_cutoff {
-                            out.push(i_inner);
-                        }
-                    }
-                }
-                out
-            })
-            .collect()
     }
+
+    // LAMMPS `npair_bin`-style bin-cell construction (O(N) instead of O(N²)).
+    //
+    // Every atom is bucketed into a 3D grid of cells whose size is >= the
+    // neighbor cutoff, so all within-cutoff partners of an atom live in the
+    // atom's own cell or one of its 26 neighbors. We then walk that 3×3×3
+    // stencil (wrapping at the box faces for PBC) and keep the pairs within
+    // `skin_sq_w_cutoff` — no O(N²) all-pairs scan, and — for `symmetric`
+    // sets — no half-list/expansion bookkeeping: each (i, j) pair is emitted
+    // from both ends, exactly like the old full symmetric expansion.
+    //
+    // Built serially on purpose: the rebuild is now cheap enough that the
+    // per-step rayon dispatch/join overhead would cost more than the work.
+    let cutoff = skin_sq_w_cutoff.sqrt();
+    let lo = cell.bounds_low;
+    let ext = cell.extent;
+
+    // Grid resolution: bin edge >= cutoff ⇒ neighbors stay within the stencil.
+    let nx = ((ext.x / cutoff).ceil() as usize).max(1);
+    let ny = ((ext.y / cutoff).ceil() as usize).max(1);
+    let nz = ((ext.z / cutoff).ceil() as usize).max(1);
+    let bx = ext.x / nx as f32;
+    let by = ext.y / ny as f32;
+    let bz = ext.z / nz as f32;
+
+    let n_inner = posits_inner.len();
+
+    // LAMMPS linked-list bins: binhead[bin] → first atom index, bins[j] → next.
+    let n_bins = nx * ny * nz;
+    let mut binhead: Vec<isize> = vec![-1; n_bins];
+    let mut bins: Vec<isize> = vec![-1; n_inner];
+
+    // Wrapped cell + flat bin index for a position.
+    let bin_index = |p: Vec3| -> (usize, usize, usize, usize) {
+        let wx = (p.x - lo.x).rem_euclid(ext.x);
+        let wy = (p.y - lo.y).rem_euclid(ext.y);
+        let wz = (p.z - lo.z).rem_euclid(ext.z);
+        let ix = (wx / bx) as usize;
+        let iy = (wy / by) as usize;
+        let iz = (wz / bz) as usize;
+        let ix = ix.min(nx - 1);
+        let iy = iy.min(ny - 1);
+        let iz = iz.min(nz - 1);
+        (ix, iy, iz, (ix * ny + iy) * nz + iz)
+    };
+
+    for (j, &p) in posits_inner.iter().enumerate() {
+        let (_, _, _, b) = bin_index(p);
+        bins[j] = binhead[b];
+        binhead[b] = j as isize;
+    }
+
+    let outer_len = posits_outer.len();
+    (0..outer_len)
+        .map(|i_outer| {
+            let mut out = Vec::new();
+            let pos_outer = posits_outer[i_outer];
+            let (ix, iy, iz, _) = bin_index(pos_outer);
+
+            for dz in -1i32..=1 {
+                let niz = (iz as i32 + dz).rem_euclid(nz as i32) as usize;
+                for dy in -1i32..=1 {
+                    let niy = (iy as i32 + dy).rem_euclid(ny as i32) as usize;
+                    for dx in -1i32..=1 {
+                        let nix = (ix as i32 + dx).rem_euclid(nx as i32) as usize;
+                        let nb = (nix * ny + niy) * nz + niz;
+                        let mut j = binhead[nb];
+                        while j >= 0 {
+                            let jj = j as usize;
+                            if jj != i_outer {
+                                // Skip static-static pairs; downstream also
+                                // skips the actual NB force between them.
+                                let mut st_st = false;
+                                if let Some(st) = is_static
+                                    && st[i_outer]
+                                    && st[jj]
+                                {
+                                    st_st = true;
+                                }
+                                if !st_st {
+                                    let d = cell.min_image(pos_outer - posits_inner[jj]);
+                                    if d.magnitude_squared() < skin_sq_w_cutoff {
+                                        out.push(jj);
+                                    }
+                                }
+                            }
+                            j = bins[jj];
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect()
 }

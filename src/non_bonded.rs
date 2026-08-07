@@ -275,13 +275,9 @@ fn calc_force_cpu(
     let n_wat = water.len();
     let n_mol = mol_start_indices.len();
 
-    // Map flattened atom index -> molecule index. We use this for assigning per-molecule-pair
-    // potential energy.
-    let find_mol_idx = |atom_idx: usize, starts: &[usize]| -> usize {
-        starts
-            .binary_search(&atom_idx)
-            .unwrap_or_else(|pos| if pos == 0 { 0 } else { pos - 1 })
-    };
+    // Map flattened atom index -> molecule index (O(1) per pair instead of a
+    // binary search over `mol_start_indices` for every std-std pair).
+    let atom_to_mol = atom_to_mol_indices(n_std, mol_start_indices);
 
     pairs
         .par_iter()
@@ -353,8 +349,8 @@ fn calc_force_cpu(
                 // todo: QC this!
                 // Experimenting with per-mol potential energy.
                 if let (BodyRef::NonWater(i_tgt), BodyRef::NonWater(i_src)) = (p.tgt, p.src) {
-                    let m_t = find_mol_idx(i_tgt, mol_start_indices);
-                    let m_s = find_mol_idx(i_src, mol_start_indices);
+                    let m_t = atom_to_mol[i_tgt];
+                    let m_s = atom_to_mol[i_src];
                     let idx_ts = m_t * n_mol + m_s;
                     energy_between_mols[idx_ts] += e_pair as f64;
 
@@ -996,6 +992,20 @@ pub fn f_nonbonded_cpu(
             return (f, e, dh_dl);
         }
         return (Vec3::new_zero(), 0., 0.);
+    }
+
+    // LAMMPS-style early exit on dist² BEFORE the sqrt: the neighbor list is
+    // built out to cutoff+skin, so a big fraction of the checked pairs lie in
+    // the skin shell and contribute nothing. Skip the sqrt/div/dir work for
+    // them (unless an alchemical lambda path needs the soft-core handling).
+    if alchemical_lambda.is_none() {
+        let lj_active = calc_lj && !overrides.lj_disabled;
+        let coul_active = calc_coulomb && !overrides.coulomb_disabled;
+        let in_lj = !lj_active || dist_sq < lj_cutoff * lj_cutoff;
+        let in_coul = !coul_active || dist_sq < coulomb_cutoff * coulomb_cutoff;
+        if !in_lj && !in_coul {
+            return (Vec3::new_zero(), 0., 0.);
+        }
     }
 
     let dist = dist_sq.sqrt();

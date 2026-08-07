@@ -127,7 +127,7 @@ impl Default for MdConfig {
             // of 10: It's loose, for this initial energy minimization. We are converting from
             // kJ mol-1 nm-1 to KCal Mol-1 Angstrom-1
             energy_minimization_tolerance: 1_000. * 0.0239005,
-            neighbor_skin: 4.0,
+            neighbor_skin: 2.0,
             solvent_template_type: Default::default(),
             skip_water_pbc_filter: false,
             spme_mesh_spacing: 1.0,
