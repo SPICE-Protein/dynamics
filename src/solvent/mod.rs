@@ -317,6 +317,7 @@ pub struct WaterMolOpc {
 
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
+#[derive(Clone)]
 pub struct WaterMolx8 {
     pub o: AtomDynamicsx8,
     pub h0: AtomDynamicsx8,
@@ -326,6 +327,7 @@ pub struct WaterMolx8 {
 
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
+#[derive(Clone)]
 pub struct WaterMolx16 {
     pub o: AtomDynamicsx16,
     pub h0: AtomDynamicsx16,
