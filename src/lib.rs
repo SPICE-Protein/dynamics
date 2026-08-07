@@ -1282,6 +1282,26 @@ impl MdState {
         self.reset_f_acc_pe_virial();
     }
 
+    /// Restore the full reference state for an independent MD segment/point:
+    /// box, positions, neighbor list, and all position/box-derived caches
+    /// (forces, SPME, PME reciprocal lattice). Reusing an engine across
+    /// temperatures/points while only restoring positions leaves the box at the
+    /// build temperature's volume — at a colder temperature the density is
+    /// wrong and the pressure spike crashes the restart (fresh builds at that
+    /// temperature are stable). Restoring the box too makes every restart
+    /// start from exactly the reference state, matching a fresh build.
+    pub fn set_state_rebuild(&mut self, dev: &ComputationDevice, pos: &[Vec3], cell: &SimBox) {
+        debug_assert_eq!(pos.len(), self.atoms.len());
+        self.cell = *cell;
+        for (a, p) in self.atoms.iter_mut().zip(pos) {
+            a.posit = *p;
+        }
+        self.build_all_neighbors(dev);
+        self.reset_f_acc_pe_virial();
+        self.spme_force_prev = None;
+        self.regen_pme(dev);
+    }
+
     pub(crate) fn apply_all_forces(
         &mut self,
         dev: &ComputationDevice,
