@@ -65,7 +65,7 @@ pub const CHARGE_UNIT_SCALER: f32 = 18.2223;
 /// We use this to load the correct data from LJ lookup tables. Since we use indices,
 /// we must index correctly into the dynamic, or static tables. We have single-index lookups
 /// for atoms acting on solvent, since there is only one O LJ type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LjTableIndices {
     /// (tgt, src)
     StdStd((usize, usize)),
@@ -80,7 +80,7 @@ pub enum LjTableIndices {
 /// The indices are flattened, of each interaction pair. Values are (σ, ε).
 ///
 /// Water-solvent is not included, as it's a single, hard-coded parameter pair.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LjTables {
     /// Non-solvent, non-solvent interactions. Upper triangle.
     pub std: Vec<(f32, f32)>,
@@ -216,6 +216,7 @@ impl BodyRef {
     }
 }
 
+#[derive(Clone)]
 pub struct NonBondedPair {
     pub tgt: BodyRef,
     pub src: BodyRef,

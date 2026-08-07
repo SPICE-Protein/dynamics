@@ -609,7 +609,7 @@ pub struct MdOverrides {
     pub snapshots_during_energy_min: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MdState {
     // todo: Update how we handle mode A/R.
     // todo: You need to rework this state in light of arbitrary mol count.

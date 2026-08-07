@@ -21,7 +21,7 @@ use crate::{ComputationDevice, MdState, barostat::SimBox};
 /// These are historically called "Verlet lists", but we're not using that term, as we use "Verlet" to refer
 /// to the integrator, which this has nothing to do with. They do have to do with their applicability to
 /// non-bonded interactions, so we call them "Non-bonded neighbors".
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct NeighborsNb {
     /// Symmetric std-std indices.
     pub std_std: Vec<Vec<usize>>,

@@ -99,7 +99,7 @@ pub fn staged_decoupling_schedule(lambda: f64) -> DecouplingSchedule {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct StateAlchemical {
     /// Index into `mol_start_indices` of the molecule being alchemically decoupled.
     ///

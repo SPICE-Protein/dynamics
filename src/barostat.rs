@@ -265,7 +265,7 @@ impl Display for VirialKcalMol {
 ///     forces are computed as m·Δr/dt² which is in amu·Å/ps², and the virial
 ///     r·(m·Δr/dt²) is therefore in amu·Å²/ps².
 /// We split this into components to make validating and debugging easier.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Virial {
     pub bonded: f64,
     pub nonbonded_short_range: f64,
@@ -319,6 +319,23 @@ impl Default for Barostat {
     fn default() -> Self {
         Self {
             virial: Default::default(),
+            rng: StdRng::seed_from_u64(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            ),
+        }
+    }
+}
+
+// StdRng (rand 0.10) is not `Clone`, so we hand-implement: the virial is copied and
+// the clone gets a fresh time-seeded RNG, mirroring `Default`. Cloned engines are
+// independent environment points, so a fresh RNG stream is exactly what we want.
+impl Clone for Barostat {
+    fn clone(&self) -> Self {
+        Self {
+            virial: self.virial.clone(),
             rng: StdRng::seed_from_u64(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

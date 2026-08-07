@@ -107,7 +107,7 @@ impl Display for ComputationTime {
 
 /// We use this to monitor performance, by component. We track
 /// Times are in μs. todo: Add integration time, H Shaking, Water settle, SPME rebuild etc A/R.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ComputationTimeSums {
     pub bonded_sum: u64,
     pub non_bonded_short_range_sum: u64,
