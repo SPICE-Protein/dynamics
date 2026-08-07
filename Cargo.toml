@@ -15,6 +15,14 @@ repository = "https://github.com/David-OConnor/dynamics"
 documentation = "https://docs.rs/dynamics"
 readme = "README.md"
 license = "MIT"
+# This is required to package the parameter files on crates.io
+include = [
+    "src/**",
+    "param_data/**",
+    "Cargo.toml",
+    "README.md",
+    "rustfmt.toml",
+]
 #exclude = [".gitignore"]
 
 
@@ -23,16 +31,6 @@ license = "MIT"
 name = "train"
 path = "src/train_params.rs"
 required-features = ["train-bin"]
-
-# This is required to package the parameter files on crates.io
-include = [
-    "src/**",
-    "param_data/**",
-    "Cargo.toml",
-    "README.md",
-    "README.md",
-    "rustfmt.toml",
-]
 
 
 [dependencies]

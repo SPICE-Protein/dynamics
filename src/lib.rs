@@ -1271,6 +1271,15 @@ impl MdState {
             a.posit = *p;
         }
         self.build_all_neighbors(dev);
+        // Externally changing positions invalidates cached force-derived state:
+        // the SPME reciprocal-space cache was computed at the old positions and
+        // the accumulated forces/accelerations belong to the previous
+        // conformation. Clear them so the next step recomputes everything at
+        // the restored positions — otherwise a restart can inherit a force /
+        // energy spike and crash (observed systematically when reusing a
+        // template engine at a new temperature).
+        self.spme_force_prev = None;
+        self.reset_f_acc_pe_virial();
     }
 
     pub(crate) fn apply_all_forces(
