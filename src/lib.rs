@@ -1262,6 +1262,17 @@ impl MdState {
 
     /// Entry point for force application. This includes bonded, non-bonded (LJ and Coulomb/SPME), and
     /// optionally external forces. (Indexed by atom).
+    /// Set all atom positions and rebuild the neighbor list — used to restart
+    /// independent MD segments from a clean reference conformation without
+    /// leaving a stale neighbor list behind.
+    pub fn set_positions_rebuild(&mut self, dev: &ComputationDevice, pos: &[Vec3]) {
+        debug_assert_eq!(pos.len(), self.atoms.len());
+        for (a, p) in self.atoms.iter_mut().zip(pos) {
+            a.posit = *p;
+        }
+        self.build_all_neighbors(dev);
+    }
+
     pub(crate) fn apply_all_forces(
         &mut self,
         dev: &ComputationDevice,
