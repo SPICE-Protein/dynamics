@@ -31,8 +31,8 @@ use na_seq::AminoAcidProtenationVariant;
 // Intrinsic pKas (typical, solvent-exposed). These are deliberately simple.
 // todo: Make them better?
 // todo: Add Arg, and Termini on AminoAcidGeneric? Are they in the Amber data?
-const PKA_ASP: f32 = 3.9;
-const PKA_GLU: f32 = 4.2;
+pub(crate) const PKA_ASP: f32 = 3.9;
+pub(crate) const PKA_GLU: f32 = 4.2;
 const PKA_HIS: f32 = 6.0;
 const PKA_CYS: f32 = 8.3;
 const PKA_LYS: f32 = 10.5;

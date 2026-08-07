@@ -28,7 +28,7 @@ use crate::{
 
 pub(crate) mod add_hydrogens_2;
 pub mod bond_vecs;
-mod ph;
+pub(crate) mod ph;
 mod sidechain;
 
 // We use the normal AA, vice general form here, as that's the one available in the mmCIF files

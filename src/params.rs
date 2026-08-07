@@ -15,6 +15,7 @@ use bio_files::{
 };
 use na_seq::{AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes, Element};
 
+use crate::add_hydrogens::ph::{PKA_ASP, PKA_GLU};
 use crate::{Dihedral, ParamError, merge_params, populate_hydrogens_dihedrals};
 
 pub type ProtFfChargeMap = HashMap<AminoAcidGeneral, Vec<ChargeParamsProtein>>;
@@ -227,6 +228,7 @@ pub fn populate_peptide_ff_and_q(
     residues: &[ResidueGeneric],
     ff_type_charge: &ProtFfChargeMapSet,
     disulfide_sg_sns: &std::collections::HashSet<u32>,
+    ph: f32,
 ) -> Result<(), ParamError> {
     // Tis is slower than if we had an index map already.
     let mut index_map = HashMap::new();
@@ -273,7 +275,21 @@ pub fn populate_peptide_ff_and_q(
             let aa_gen = if is_cyx {
                 AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Cyx)
             } else {
-                AminoAcidGeneral::Standard(*aa)
+                // Select the protonation variant consistent with the H-placement
+                // rules in add_hydrogens/ph.rs: below the acidic pKa, Asp/Glu are
+                // the protonated ASH/GLH forms, whose carboxylate O is typed "OH"
+                // and the added H "HO" (amino19.lib) — so the O–H bond resolves
+                // instead of the invalid O2–HB2 fallback that crashed low-pH
+                // builds (pH 0–4 → "Missing bond params for O2-HB2").
+                match *aa {
+                    AminoAcid::Asp if ph < PKA_ASP => {
+                        AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Ash)
+                    }
+                    AminoAcid::Glu if ph < PKA_GLU => {
+                        AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Glh)
+                    }
+                    _ => AminoAcidGeneral::Standard(*aa),
+                }
             };
 
             let charge_map = match res.end {
@@ -421,7 +437,7 @@ pub fn prepare_peptide(
     let disulfide_sg_sns = crate::add_hydrogens::find_disulfide_sgs(atoms);
 
     // todo: Similar checks for empty etc.
-    populate_peptide_ff_and_q(atoms, residues, ff_map, &disulfide_sg_sns)?;
+    populate_peptide_ff_and_q(atoms, residues, ff_map, &disulfide_sg_sns, ph)?;
 
     if bonds.is_empty() {
         *bonds = create_bonds(atoms);
@@ -484,7 +500,7 @@ pub fn prepare_peptide_mmcif(
     let disulfide_sg_sns = crate::add_hydrogens::find_disulfide_sgs(&mol.atoms);
 
     // todo: Similar checks for empty etc.
-    populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map, &disulfide_sg_sns)?;
+    populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map, &disulfide_sg_sns, ph)?;
 
     let bonds = create_bonds(&mol.atoms);
     // Distance-based bond inference creates spurious cross-residue bonds in
