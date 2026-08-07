@@ -190,6 +190,7 @@ fn add_h_sc_het(
     h_default: &AtomGeneric,
     residues: &[ResidueGeneric],
     digit_map: &DigitMap,
+    disulfide_sg_sns: &std::collections::HashSet<u32>,
 ) -> Result<(), ParamError> {
     let h_default_sc = AtomGeneric {
         // role: Some(AtomRole::H_Sidechain),
@@ -557,10 +558,13 @@ fn add_h_sc_het(
                 }
             }
             Sulfur => {
-                // Thiol (SH): single H when SG has exactly one heavy-atom bond (to CB).
+                // Thiol (SH): single H when SG has exactly one heavy-atom bond (to CB)
+                // and it is NOT part of a disulfide bridge. A bridged SG has two bonds
+                // (to CB and to the partner SG) and must not get a thiol H — its partner
+                // S occupies that position.
                 // CYS (protonated) has HG in the digit_map; CYM (deprotonated) does not,
                 // so h_type_in_res_sidechain returns None for CYM and the H is skipped.
-                if atoms_bonded.len() == 1 {
+                if atoms_bonded.len() == 1 && !disulfide_sg_sns.contains(&atom.serial_number) {
                     let (bond_prev, bond_back2) =
                         match get_prev_bonds(atom, atoms, i, atoms_bonded[0]) {
                             Ok(v) => v,
@@ -750,6 +754,7 @@ pub fn aa_data_from_coords(
     prev_cp_ca: Option<(Vec3, Vec3)>,
     next_n: Option<Vec3>,
     digit_map: &DigitMap,
+    disulfide_sg_sns: &std::collections::HashSet<u32>,
 ) -> Result<(Dihedral, Vec<AtomGeneric>, Option<(Vec3, Vec3)>), ParamError> {
     // todo: With_capacity based on aa?
 
@@ -808,7 +813,14 @@ pub fn aa_data_from_coords(
         )?;
     }
 
-    add_h_sc_het(&mut hydrogens, atoms, &h_default, residues, digit_map)?;
+    add_h_sc_het(
+        &mut hydrogens,
+        atoms,
+        &h_default,
+        residues,
+        digit_map,
+        disulfide_sg_sns,
+    )?;
 
     Ok((dihedral, hydrogens, this_cp_ca))
 }

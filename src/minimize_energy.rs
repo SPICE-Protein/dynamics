@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use lin_alg::f32::Vec3;
 
-use crate::{ComputationDevice, MdState};
+use crate::{AtomDynamics, ComputationDevice, MdState};
 
 // emtol and emstep come from cfg.energy_minimization; see EnergyMinimization.
 // nstcgsteep (CG) and nbfgscorr (L-BFGS) are not used: this is a steepest-descent minimizer.
@@ -66,27 +66,197 @@ impl MdState {
         println!("Minimizing energy...");
         let start = Instant::now();
 
-        let (mut last_step, mut alpha, mut e_prev, initial_velocities, prev_recip) =
-            self.minimize_energy_setup(dev, &external_force);
-
-        let mut iters = 0;
-        for _ in 0..max_iters {
-            iters += 1;
-            if self.step_energy_min(
-                dev,
-                &mut last_step,
-                &mut alpha,
-                &mut e_prev,
-                &external_force,
-            ) {
-                break; // Converged.
-            }
-        }
-
-        self.minimize_energy_cleanup(dev, prev_recip, &initial_velocities);
+        let iters = self.minimize_lbfgs(dev, max_iters, &external_force);
 
         let elapsed = start.elapsed().as_millis();
         println!("Complete in {elapsed} ms. Used {iters} of {max_iters} iters");
+    }
+
+    /// L-BFGS energy minimization (ref: OpenMM `LocalEnergyMinimizer`, Nocedal & Wright).
+    ///
+    /// Limited-memory BFGS with a strong-Wolfe line search. Every evaluation
+    /// rebuilds the neighbor list and computes the FULL forces at the current
+    /// coordinates, so — unlike the steepest-descent loop — it cannot
+    /// false-converge on a stale neighbor list (the root cause of "minimizer
+    /// converges but production step 1 sees ~100× larger forces" blow-ups).
+    ///
+    /// Returns the number of outer iterations used.
+    fn minimize_lbfgs(
+        &mut self,
+        dev: &ComputationDevice,
+        max_iters: usize,
+        external_force: &Option<Vec<Vec3>>,
+    ) -> usize {
+        // L-BFGS / line-search constants (same values as OpenMM).
+        const NUM_VECTORS: usize = 6;
+        const FTOL: f64 = 1e-4; // strong-Wolfe c1 (Armijo)
+        const WOLFE: f64 = 0.9; // strong-Wolfe c2 (curvature)
+        const STEP_SCALE_DOWN: f64 = 0.5;
+        const STEP_SCALE_UP: f64 = 2.1;
+        const MIN_STEP: f64 = 1e-20;
+        const MAX_STEP: f64 = 1e20;
+        const MAX_LS: usize = 40;
+
+        let n = self.atoms.len();
+        if n == 0 {
+            return 0;
+        }
+        let nd = 3 * n;
+        let tolerance = (self.cfg.energy_minimization_tolerance as f64) * (n as f64).sqrt();
+
+        let dot = |a: &[f32], b: &[f32]| -> f64 { a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum() };
+        let norm = |a: &[f32]| -> f64 { dot(a, a).sqrt() };
+
+        let flat_pos = |atoms: &[AtomDynamics]| -> Vec<f32> {
+            atoms.iter().flat_map(|a| [a.posit.x, a.posit.y, a.posit.z]).collect()
+        };
+        let flat_grad = |atoms: &[AtomDynamics]| -> Vec<f32> {
+            atoms.iter().flat_map(|a| [-a.force.x, -a.force.y, -a.force.z]).collect()
+        };
+        let write_pos = |atoms: &mut [AtomDynamics], x: &[f32]| {
+            for (i, a) in atoms.iter_mut().enumerate() {
+                a.posit = Vec3::new(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+            }
+        };
+
+        // Evaluate full forces at the current coordinates (always fresh neighbors).
+        self.build_all_neighbors(dev);
+        compute_forces_and_energy(self, dev, external_force);
+
+        let mut x = flat_pos(&self.atoms);
+        let mut grad = flat_grad(&self.atoms);
+        let mut energy = self.potential_energy;
+        let mut used = 0;
+        if norm(&grad) <= tolerance {
+            self.finish_minimize(dev);
+            return used;
+        }
+
+        // L-BFGS history (s, y, rho), newest last.
+        let mut s_hist: Vec<Vec<f32>> = Vec::with_capacity(NUM_VECTORS);
+        let mut y_hist: Vec<Vec<f32>> = Vec::with_capacity(NUM_VECTORS);
+        let mut rho_hist: Vec<f64> = Vec::with_capacity(NUM_VECTORS);
+
+        for it in 0..max_iters {
+            used = it + 1;
+
+            // ---- two-loop recursion -> search direction ----
+            let m = s_hist.len();
+            let mut q = grad.clone();
+            let mut alpha = vec![0.0f64; m];
+            for i in (0..m).rev() {
+                alpha[i] = rho_hist[i] * dot(&s_hist[i], &q);
+                for k in 0..nd {
+                    q[k] -= (alpha[i] as f32) * y_hist[i][k];
+                }
+            }
+            let h0 = if m > 0 {
+                let sy = dot(&s_hist[m - 1], &y_hist[m - 1]);
+                let yy = dot(&y_hist[m - 1], &y_hist[m - 1]);
+                if yy > 0.0 { sy / yy } else { 1.0 }
+            } else {
+                1.0
+            };
+            let mut r = vec![0.0f32; nd];
+            for k in 0..nd {
+                r[k] = (h0 as f32) * q[k];
+            }
+            for i in 0..m {
+                let beta = rho_hist[i] * dot(&y_hist[i], &r);
+                for k in 0..nd {
+                    r[k] += ((alpha[i] - beta) as f32) * s_hist[i][k];
+                }
+            }
+            let mut dir = vec![0.0f32; nd];
+            for k in 0..nd {
+                dir[k] = -r[k];
+            }
+
+            // ---- strong-Wolfe line search ----
+            let x0 = x.clone();
+            let grad0 = grad.clone();
+            let e0 = energy;
+            let gd0 = dot(&grad0, &dir);
+            if gd0 >= 0.0 {
+                break; // not a descent direction
+            }
+
+            let mut step = 1.0f64;
+            let mut ls_ok = false;
+            let mut x_new = x0.clone();
+            let mut grad_new = grad0.clone();
+            let mut e_new = e0;
+            for _ in 0..MAX_LS {
+                for k in 0..nd {
+                    x_new[k] = x0[k] + (step as f32) * dir[k];
+                }
+                write_pos(&mut self.atoms, &x_new);
+                self.build_all_neighbors(dev);
+                compute_forces_and_energy(self, dev, external_force);
+                e_new = self.potential_energy;
+                for (i, a) in self.atoms.iter().enumerate() {
+                    grad_new[3 * i] = -a.force.x;
+                    grad_new[3 * i + 1] = -a.force.y;
+                    grad_new[3 * i + 2] = -a.force.z;
+                }
+                // Armijo condition.
+                if e_new <= e0 + FTOL * step * gd0 {
+                    let gd = dot(&grad_new, &dir);
+                    if gd.abs() <= WOLFE * gd0.abs() {
+                        ls_ok = true;
+                        break;
+                    }
+                    step *= STEP_SCALE_UP;
+                } else {
+                    step *= STEP_SCALE_DOWN;
+                }
+                if step < MIN_STEP || step > MAX_STEP {
+                    break;
+                }
+            }
+
+            if !ls_ok {
+                // Restore the last accepted point and stop.
+                write_pos(&mut self.atoms, &x);
+                break;
+            }
+
+            // ---- update L-BFGS history ----
+            let s_new: Vec<f32> = (0..nd).map(|k| x_new[k] - x0[k]).collect();
+            let y_new: Vec<f32> = (0..nd).map(|k| grad_new[k] - grad0[k]).collect();
+            let sy = dot(&s_new, &y_new);
+            if sy > 1e-10 {
+                if s_hist.len() == NUM_VECTORS {
+                    s_hist.remove(0);
+                    y_hist.remove(0);
+                    rho_hist.remove(0);
+                }
+                s_hist.push(s_new);
+                y_hist.push(y_new);
+                rho_hist.push(1.0 / sy);
+            }
+
+            x = x_new;
+            grad = grad_new;
+            energy = e_new;
+
+            if norm(&grad) <= tolerance {
+                break;
+            }
+        }
+
+        write_pos(&mut self.atoms, &x);
+        self.finish_minimize(dev);
+        used
+    }
+
+    /// Common post-minimization cleanup: zero forces, regenerate the PME grid,
+    /// and drop the stale SPME cache so the next (production) step recomputes
+    /// forces for the current coordinates.
+    fn finish_minimize(&mut self, dev: &ComputationDevice) {
+        self.reset_f_acc_pe_virial();
+        self.regen_pme(dev);
+        self.spme_force_prev = None;
     }
 
     /// Separate, so can be called `separately by an application, e.g. if it needs to
@@ -156,6 +326,13 @@ impl MdState {
         self.cfg.overrides.long_range_recip_disabled = prev_long_range;
         self.regen_pme(dev);
 
+        // The cached SPME forces were computed for the pre-cleanup coordinates;
+        // recenter (above) shifts the system relative to the box, so reusing the
+        // cache on the first production step would apply stale reciprocal forces
+        // (observed: step-1 maxF ~200 vs the minimized ~2). Drop it and force a
+        // fresh SPME computation on the next step.
+        self.spme_force_prev = None;
+
         // Re-apply our initial velocities.
         for (i, a) in self.atoms.iter_mut().enumerate() {
             a.vel = initial_velocities[i];
@@ -215,9 +392,16 @@ impl MdState {
             // never refreshed — missing close pairs that emerged during relaxation. That made
             // the minimizer "converge" on a stale force field while production (which does
             // track cumulative displacement) suddenly saw much larger forces on step 1.
+            // Always rebuild neighbors during minimization. The old thresholded
+            // `build_neighbors_if_needed` let the pair list go stale: hydrogens
+            // pinned by their bonds move little, so the cumulative displacement
+            // never crossed the skin threshold and close pairs that emerged
+            // during relaxation were missing — the minimizer then "converged" on
+            // forces that omitted exactly the clashes production MD sees (maxF
+            // ~2 at min end vs ~100-200 on production step 1).
             self.update_max_displacement_since_rebuild();
 
-            self.build_neighbors_if_needed(dev);
+            self.build_all_neighbors(dev);
 
             compute_forces_and_energy(self, dev, external_force);
             let e_new = self.potential_energy;
@@ -248,14 +432,14 @@ impl MdState {
             if alpha_try < ALPHA_MIN {
                 *alpha = alpha_try;
                 self.update_max_displacement_since_rebuild();
-                self.build_neighbors_if_needed(dev);
+                self.build_all_neighbors(dev);
                 compute_forces_and_energy(self, dev, external_force);
                 return true;
             }
 
             // Ensure neighbors/forces are valid at the reverted geometry, then retry with smaller alpha_try
             self.update_max_displacement_since_rebuild();
-            self.build_neighbors_if_needed(dev);
+            self.build_all_neighbors(dev);
             compute_forces_and_energy(self, dev, external_force);
         }
     }

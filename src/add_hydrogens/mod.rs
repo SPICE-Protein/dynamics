@@ -501,6 +501,28 @@ fn resolve_h_clashes(
     n
 }
 
+/// Find Cys SG atoms that form a disulfide bridge (SG–SG distance < 2.4 Å).
+/// Used to prevent protonating bridged cysteines during H placement.
+pub fn find_disulfide_sgs(atoms: &[AtomGeneric]) -> HashSet<u32> {
+    let sg: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(&a.type_in_res, Some(AtomTypeInRes::SG)))
+        .map(|(i, _)| i)
+        .collect();
+    let mut out = HashSet::new();
+    for a in 0..sg.len() {
+        for b in (a + 1)..sg.len() {
+            let d = (atoms[sg[a]].posit - atoms[sg[b]].posit).magnitude();
+            if d < 2.4 {
+                out.insert(atoms[sg[a]].serial_number);
+                out.insert(atoms[sg[b]].serial_number);
+            }
+        }
+    }
+    out
+}
+
 pub fn populate_hydrogens_dihedrals(
     atoms: &mut Vec<AtomGeneric>,
     residues: &mut [ResidueGeneric],
@@ -517,6 +539,11 @@ pub fn populate_hydrogens_dihedrals(
     for (i, atom) in atoms.iter().enumerate() {
         index_map.insert(atom.serial_number, i);
     }
+
+    // Detect Cys-Cys disulfide bridges (SG–SG < 2.4 Å) so the hydrogen
+    // placement below does not protonate bonded SG atoms — otherwise every
+    // disulfide S gets a thiol H clashing inside the bridge (huge forces).
+    let disulfide_sg_sns = find_disulfide_sgs(atoms);
 
     let mut dihedrals = Vec::with_capacity(residues.len());
 
@@ -577,6 +604,7 @@ pub fn populate_hydrogens_dihedrals(
             prev_cp_ca,
             n_next_pos,
             &digit_map,
+            &disulfide_sg_sns,
         )?;
 
         // Get the first atom's chain; probably OK for assigning a chain to H.

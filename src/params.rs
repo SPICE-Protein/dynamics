@@ -226,6 +226,7 @@ pub fn populate_peptide_ff_and_q(
     atoms: &mut [AtomGeneric],
     residues: &[ResidueGeneric],
     ff_type_charge: &ProtFfChargeMapSet,
+    disulfide_sg_sns: &std::collections::HashSet<u32>,
 ) -> Result<(), ParamError> {
     // Tis is slower than if we had an index map already.
     let mut index_map = HashMap::new();
@@ -261,7 +262,19 @@ pub fn populate_peptide_ff_and_q(
 
             // todo: Eventually, determine how to load non-standard AA variants from files; set up your
             // todo state to use those labels. They are available in the params.
-            let aa_gen = AminoAcidGeneral::Standard(*aa);
+            // Disulfide-bonded Cys uses the CYX (oxidized) charge/type set, so its
+            // SG gets the "S" ff type (and matching charge) instead of the thiol
+            // "SH" — required for the S–S bond terms to resolve.
+            let is_cyx = *aa == AminoAcid::Cys
+                && res
+                    .atom_sns
+                    .iter()
+                    .any(|sn| disulfide_sg_sns.contains(sn));
+            let aa_gen = if is_cyx {
+                AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Cyx)
+            } else {
+                AminoAcidGeneral::Standard(*aa)
+            };
 
             let charge_map = match res.end {
                 ResidueEnd::Internal => &ff_type_charge.internal,
@@ -405,8 +418,10 @@ pub fn prepare_peptide(
         dihedrals = populate_hydrogens_dihedrals(atoms, residues, chains, ff_map, ph)?;
     }
 
+    let disulfide_sg_sns = crate::add_hydrogens::find_disulfide_sgs(atoms);
+
     // todo: Similar checks for empty etc.
-    populate_peptide_ff_and_q(atoms, residues, ff_map)?;
+    populate_peptide_ff_and_q(atoms, residues, ff_map, &disulfide_sg_sns)?;
 
     if bonds.is_empty() {
         *bonds = create_bonds(atoms);
@@ -464,8 +479,12 @@ pub fn prepare_peptide_mmcif(
         )?;
     }
 
+    // Detect disulfide bridges (SG–SG < 2.4 Å) — selects the CYX (oxidized Cys)
+    // charge/type set so bridged SGs get the "S" ff type, not thiol "SH".
+    let disulfide_sg_sns = crate::add_hydrogens::find_disulfide_sgs(&mol.atoms);
+
     // todo: Similar checks for empty etc.
-    populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map)?;
+    populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map, &disulfide_sg_sns)?;
 
     let bonds = create_bonds(&mol.atoms);
     // Distance-based bond inference creates spurious cross-residue bonds in
@@ -473,6 +492,9 @@ pub fn prepare_peptide_mmcif(
     // Keep only physically sensible bonds: intra-residue, backbone peptide
     // bonds C(i)-N(i+1), and Cys-Cys disulfides.
     let bonds = filter_protein_bonds(&mol.atoms, &mol.residues, bonds);
+    // `create_bonds` has no S–S bond spec, so disulfide bridges are never
+    // distance-inferred. Add them explicitly (filter keeps SG–SG bonds).
+    let bonds = add_disulfide_bonds(&mol.atoms, &mol.residues, bonds);
 
     Ok((bonds, dihedrals))
 }
@@ -486,6 +508,49 @@ pub fn prepare_peptide_mmcif(
 ///   1. intra-residue bonds (both atoms in the same residue),
 ///   2. backbone peptide bonds C(i)-N(i+1) between consecutive residues,
 ///   3. Cys-Cys disulfide bridges (SG-SG).
+/// `create_bonds` has no S–S bond spec, so disulfide bridges are never
+/// distance-inferred. Add SG–SG bonds for cysteine pairs within disulfide-bond
+/// distance (< 2.4 Å), so the bridge is bonded (excluded from nonbonded, correct
+/// geometry) and the FF applies S–S terms.
+fn add_disulfide_bonds(
+    atoms: &[AtomGeneric],
+    _residues: &[ResidueGeneric],
+    mut bonds: Vec<BondGeneric>,
+) -> Vec<BondGeneric> {
+    use AtomTypeInRes::SG;
+    let is_sg = |a: &AtomGeneric| matches!(a.type_in_res, Some(SG));
+    let sg: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| is_sg(a))
+        .map(|(i, _)| i)
+        .collect();
+    let existing: std::collections::HashSet<(u32, u32)> = bonds
+        .iter()
+        .map(|b| (b.atom_0_sn.min(b.atom_1_sn), b.atom_0_sn.max(b.atom_1_sn)))
+        .collect();
+    for a in 0..sg.len() {
+        for b in (a + 1)..sg.len() {
+            let (i, j) = (sg[a], sg[b]);
+            let d = (atoms[i].posit - atoms[j].posit).magnitude();
+            if d < 2.4 {
+                let key = (
+                    atoms[i].serial_number.min(atoms[j].serial_number),
+                    atoms[i].serial_number.max(atoms[j].serial_number),
+                );
+                if !existing.contains(&key) {
+                    bonds.push(BondGeneric {
+                        bond_type: bio_files::BondType::Single,
+                        atom_0_sn: atoms[i].serial_number,
+                        atom_1_sn: atoms[j].serial_number,
+                    });
+                }
+            }
+        }
+    }
+    bonds
+}
+
 fn filter_protein_bonds(
     atoms: &[AtomGeneric],
     residues: &[ResidueGeneric],

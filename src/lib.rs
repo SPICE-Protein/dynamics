@@ -1298,7 +1298,10 @@ impl MdState {
         if !self.cfg.overrides.long_range_recip_disabled {
             let compute_spme_every_step = self.alchemical.mol_idx.is_some();
 
-            if compute_spme_every_step || self.step_count.is_multiple_of(SPME_RATIO) {
+            if compute_spme_every_step
+                || self.step_count.is_multiple_of(SPME_RATIO)
+                || self.spme_force_prev.is_none()
+            {
                 // Compute SPME recip forces as usual, and cache for use in steps where we don't.
 
                 // Note: This relies on SPME_RATIO being divisible by COMPUTATION_TIME_RATIO.
