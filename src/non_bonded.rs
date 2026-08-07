@@ -230,6 +230,12 @@ pub struct NonBondedPair {
     /// handling.
     /// False unless using an alchemical free-energy computation.
     pub alch_interaction: bool,
+    /// True for the COMPACT rigid-water pairs: one entry per water–water molecule
+    /// pair (or per std–water pair) whose dedicated kernel computes all the
+    /// site–site interactions (O-O LJ + 3×3 charged-site Coulomb) in a single
+    /// call, sharing one minimum-image displacement. The per-site expansion is
+    /// used instead when `alch_interaction` requires soft-core handling.
+    pub water_full: bool,
 }
 
 /// Add a force into the right accumulator (std or solvent). Static never accumulates.
@@ -241,13 +247,19 @@ fn add_to_sink(
 ) {
     match body_type {
         BodyRef::NonWater(i) => sink_non_water[i] += f,
-        BodyRef::Water { mol, site } => match site {
-            WaterSite::O => sink_wat[mol].f_o += f,
-            WaterSite::M => sink_wat[mol].f_m += f,
-            WaterSite::H0 => sink_wat[mol].f_h0 += f,
-            WaterSite::H1 => sink_wat[mol].f_h1 += f,
-        },
+        BodyRef::Water { mol, site } => add_water_site_force(&mut sink_wat[mol], site, f),
         // BodyRef::Static(_) => (),
+    }
+}
+
+/// Add a force to a single site of a water molecule's accumulator.
+#[inline]
+fn add_water_site_force(f: &mut ForcesOnWaterMol, site: WaterSite, v: Vec3F64) {
+    match site {
+        WaterSite::O => f.f_o += v,
+        WaterSite::M => f.f_m += v,
+        WaterSite::H0 => f.f_h0 += v,
+        WaterSite::H1 => f.f_h1 += v,
     }
 }
 
@@ -302,35 +314,107 @@ fn calc_force_cpu(
                 mut alch_dh_dl,
             ),
              p| {
-                let a_t = p.tgt.get(atoms_std, water);
-                let a_s = p.src.get(atoms_std, water);
+                let mut e_pair = 0.0f32;
+                let mut dh_dl_pair = 0.0f32;
 
-                let alchemical_lambda = p
-                    .alch_interaction
-                    .then_some(lambda_alch.clamp(0.0, 1.0) as f32);
+                if p.water_full {
+                    // Compact rigid-water pairs: the dedicated kernels compute
+                    // all site-site interactions and accumulate directly into
+                    // the per-thread force sinks (no per-site add_to_sink).
+                    match (p.tgt, p.src) {
+                        (BodyRef::Water { mol: mi, .. }, BodyRef::Water { mol: mj, .. }) => {
+                            // Disjoint mutable borrows of f_wat at two indices.
+                            let (f_wa, f_wb) = if mi < mj {
+                                let (lo, hi) = f_wat.split_at_mut(mj);
+                                (&mut lo[mi], &mut hi[0])
+                            } else {
+                                let (lo, hi) = f_wat.split_at_mut(mi);
+                                (&mut hi[0], &mut lo[mj])
+                            };
+                            // Water-water energy is intentionally discarded
+                            // (solvent-only energy isn't part of the total).
+                            let _ = f_water_water_cpu(
+                                &mut virial,
+                                f_wa,
+                                f_wb,
+                                &water[mi],
+                                &water[mj],
+                                cell,
+                                lj_tables,
+                                overrides,
+                                spme_alpha,
+                                coulomb_cutoff,
+                                lj_cutoff,
+                            );
+                        }
+                        (BodyRef::NonWater(i), BodyRef::Water { mol, .. }) => {
+                            e_pair = f_water_std_cpu(
+                                &mut virial,
+                                &mut f_std[i],
+                                &mut f_wat[mol],
+                                &atoms_std[i],
+                                &water[mol],
+                                cell,
+                                lj_tables,
+                                overrides,
+                                spme_alpha,
+                                coulomb_cutoff,
+                                lj_cutoff,
+                                i,
+                            ) as f32;
+                        }
+                        (BodyRef::Water { mol, .. }, BodyRef::NonWater(i)) => {
+                            // Not emitted (std is always tgt), but symmetric-safe.
+                            e_pair = f_water_std_cpu(
+                                &mut virial,
+                                &mut f_std[i],
+                                &mut f_wat[mol],
+                                &atoms_std[i],
+                                &water[mol],
+                                cell,
+                                lj_tables,
+                                overrides,
+                                spme_alpha,
+                                coulomb_cutoff,
+                                lj_cutoff,
+                                i,
+                            ) as f32;
+                        }
+                        _ => unreachable!("water_full pair without any water"),
+                    }
+                } else {
+                    let a_t = p.tgt.get(atoms_std, water);
+                    let a_s = p.src.get(atoms_std, water);
 
-                let (f, e_pair, dh_dl_pair) = f_nonbonded_cpu(
-                    &mut virial,
-                    a_t,
-                    a_s,
-                    cell,
-                    p.scale_14,
-                    &p.lj_indices,
-                    lj_tables,
-                    p.calc_lj,
-                    p.calc_coulomb,
-                    overrides,
-                    spme_alpha,
-                    coulomb_cutoff,
-                    lj_cutoff,
-                    alchemical_lambda,
-                );
+                    let alchemical_lambda = p
+                        .alch_interaction
+                        .then_some(lambda_alch.clamp(0.0, 1.0) as f32);
 
-                // Convert to f64 prior to summing.
-                let f: Vec3F64 = f.into();
-                add_to_sink(&mut f_std, &mut f_wat, p.tgt, f);
-                if p.symmetric {
-                    add_to_sink(&mut f_std, &mut f_wat, p.src, -f);
+                    let (f, ee, dd) = f_nonbonded_cpu(
+                        &mut virial,
+                        a_t,
+                        a_s,
+                        cell,
+                        p.scale_14,
+                        &p.lj_indices,
+                        lj_tables,
+                        p.calc_lj,
+                        p.calc_coulomb,
+                        overrides,
+                        spme_alpha,
+                        coulomb_cutoff,
+                        lj_cutoff,
+                        alchemical_lambda,
+                    );
+                    e_pair = ee;
+                    dh_dl_pair = dd;
+
+                    // Convert to f64 prior to summing.
+                    let f: Vec3F64 = f.into();
+                    add_to_sink(&mut f_std, &mut f_wat, p.tgt, f);
+                    if p.symmetric {
+                        add_to_sink(&mut f_std, &mut f_wat, p.src, -f);
+                    }
                 }
 
                 // We are not interested, in this point, at potential energy that only involves solvent atoms.
@@ -595,6 +679,7 @@ impl MdState {
                             calc_coulomb: true,
                             symmetric: true,
                             alch_interaction,
+                            water_full: false,
                         })
                     })
             })
@@ -604,66 +689,112 @@ impl MdState {
         // todo: In general, your static exclusions will get messed up with this logic.
 
         // Forces from solvent on non-solvent atoms, and vice-versa
-        let mut pairs_std_water: Vec<_> = (0..n_std)
-            .flat_map(|i_std| {
-                self.neighbors_nb.std_water[i_std]
-                    .iter()
-                    .copied()
-                    .flat_map(move |i_water| {
-                        let alch_interaction =
-                            alch_mol_idx.is_some_and(|m_alch| atom_to_mol[i_std] == m_alch);
-                        sites.into_iter().map(move |site| NonBondedPair {
+        // Non-alchemical: ONE compact pair per std–water molecule; the dedicated
+        // `f_water_std_cpu` kernel computes O-solute LJ + (M,H0,H1)-solute Coulomb
+        // in a single call (4× fewer pairs than the old per-site expansion).
+        // Alchemical: fall back to the per-site expansion (soft-core needs it).
+        let mut pairs_std_water: Vec<_> = if alch_mol_idx.is_none() {
+            (0..n_std)
+                .flat_map(|i_std| {
+                    self.neighbors_nb.std_water[i_std]
+                        .iter()
+                        .copied()
+                        .map(move |i_water| NonBondedPair {
                             tgt: BodyRef::NonWater(i_std),
-                            src: BodyRef::Water { mol: i_water, site },
+                            src: BodyRef::Water { mol: i_water, site: WaterSite::O },
                             scale_14: false,
                             lj_indices: LjTableIndices::StdWater(i_std),
-                            calc_lj: site == WaterSite::O,
-                            calc_coulomb: site != WaterSite::O,
-                            symmetric: true,
-                            alch_interaction,
-                        })
-                    })
-            })
-            .collect();
-
-        // ------ Water on solvent ------
-        let mut pairs_water_water = Vec::new();
-
-        for i_0 in 0..n_water_mols {
-            for &i_1 in &self.neighbors_nb.water_water[i_0] {
-                if i_1 <= i_0 {
-                    continue;
-                }
-
-                for &site_0 in &sites {
-                    for &site_1 in &sites {
-                        let calc_lj = site_0 == WaterSite::O && site_1 == WaterSite::O;
-                        let calc_coulomb = site_0 != WaterSite::O && site_1 != WaterSite::O;
-
-                        if !(calc_lj || calc_coulomb) {
-                            continue;
-                        }
-
-                        pairs_water_water.push(NonBondedPair {
-                            tgt: BodyRef::Water {
-                                mol: i_0,
-                                site: site_0,
-                            },
-                            src: BodyRef::Water {
-                                mol: i_1,
-                                site: site_1,
-                            },
-                            scale_14: false,
-                            lj_indices: LjTableIndices::WaterWater,
-                            calc_lj,
-                            calc_coulomb,
+                            calc_lj: true,
+                            calc_coulomb: true,
                             symmetric: true,
                             alch_interaction: false,
-                        });
+                            water_full: true,
+                        })
+                })
+                .collect()
+        } else {
+            (0..n_std)
+                .flat_map(|i_std| {
+                    self.neighbors_nb.std_water[i_std]
+                        .iter()
+                        .copied()
+                        .flat_map(move |i_water| {
+                            let alch_interaction =
+                                alch_mol_idx.is_some_and(|m_alch| atom_to_mol[i_std] == m_alch);
+                            sites.into_iter().map(move |site| NonBondedPair {
+                                tgt: BodyRef::NonWater(i_std),
+                                src: BodyRef::Water { mol: i_water, site },
+                                scale_14: false,
+                                lj_indices: LjTableIndices::StdWater(i_std),
+                                calc_lj: site == WaterSite::O,
+                                calc_coulomb: site != WaterSite::O,
+                                symmetric: true,
+                                alch_interaction,
+                                water_full: false,
+                            })
+                        })
+                })
+                .collect()
+        };
+
+        // ------ Water on solvent ------
+        // Non-alchemical: ONE pair per water–water molecule pair;
+        // `f_water_water_cpu` computes O-O LJ + all 9 charged-site Coulomb in a
+        // single call (~10× fewer pairs than the old per-site expansion).
+        let mut pairs_water_water = if alch_mol_idx.is_none() {
+            let mut v = Vec::new();
+            for i_0 in 0..n_water_mols {
+                for &i_1 in &self.neighbors_nb.water_water[i_0] {
+                    if i_1 <= i_0 {
+                        continue;
+                    }
+                    v.push(NonBondedPair {
+                        tgt: BodyRef::Water { mol: i_0, site: WaterSite::O },
+                        src: BodyRef::Water { mol: i_1, site: WaterSite::O },
+                        scale_14: false,
+                        lj_indices: LjTableIndices::WaterWater,
+                        calc_lj: true,
+                        calc_coulomb: true,
+                        symmetric: true,
+                        alch_interaction: false,
+                        water_full: true,
+                    });
+                }
+            }
+            v
+        } else {
+            let mut v = Vec::new();
+            for i_0 in 0..n_water_mols {
+                for &i_1 in &self.neighbors_nb.water_water[i_0] {
+                    if i_1 <= i_0 {
+                        continue;
+                    }
+                    for &site_0 in &sites {
+                        for &site_1 in &sites {
+                            let calc_lj = site_0 == WaterSite::O && site_1 == WaterSite::O;
+                            let calc_coulomb = site_0 != WaterSite::O && site_1 != WaterSite::O;
+
+                            if !(calc_lj || calc_coulomb) {
+                                continue;
+                            }
+
+                            v.push(NonBondedPair {
+                                tgt: BodyRef::Water { mol: i_0, site: site_0 },
+                                src: BodyRef::Water { mol: i_1, site: site_1 },
+                                scale_14: false,
+                                lj_indices: LjTableIndices::WaterWater,
+                                calc_lj,
+                                calc_coulomb,
+                                symmetric: true,
+                                alch_interaction: false,
+                                water_full: false,
+                            });
+                        }
                     }
                 }
             }
-        }
+            v
+        };
 
         // todo: Consider just removing the functional parts above, and add to `pairs` directly.
         // Combine pairs into a single set; we compute in one parallel pass.
@@ -1070,6 +1201,165 @@ pub fn f_nonbonded_cpu(
     *virial_w += diff.dot(force) as f64;
 
     (force, energy, dh_dl)
+}
+
+/// Specialized OPC water–water kernel (rigid, LAMMPS tip4p-style).
+///
+/// One call per water–water molecule pair instead of ~10 generic site-pair
+/// invocations. The O–O minimum-image displacement is computed ONCE and the
+/// other site–site displacements are derived by adding the small rigid
+/// intramolecular offsets (box >> molecule, so this stays in the correct
+/// periodic image — the standard rigid-water trick in GROMACS/OpenMM/LAMMPS).
+/// Forces accumulate directly into both molecules' per-site accumulators.
+/// Water–water energy is returned but the caller excludes it from the reported
+/// total (matches the generic path, which ignores solvent-only energy).
+///
+/// `wa` is the target water, `wb` the source: forces on `wa` come out positive
+/// (repulsion/attraction along the O→O direction), `wb` receives the opposite.
+#[allow(clippy::too_many_arguments)]
+fn f_water_water_cpu(
+    virial_w: &mut f64,
+    f_wa: &mut ForcesOnWaterMol,
+    f_wb: &mut ForcesOnWaterMol,
+    wa: &WaterMolOpc,
+    wb: &WaterMolOpc,
+    cell: &SimBox,
+    lj_tables: &LjTables,
+    overrides: &MdOverrides,
+    spme_alpha: f32,
+    coulomb_cutoff: f32,
+    lj_cutoff: f32,
+) -> f64 {
+    let o_a = wa.o.posit;
+    let o_b = wb.o.posit;
+    let d_oo = cell.min_image(o_a - o_b);
+    let mut energy = 0.0f64;
+
+    // --- O–O Lennard-Jones (only O carries LJ params in OPC) ---
+    if !overrides.lj_disabled {
+        let r2 = d_oo.magnitude_squared();
+        if r2 > 1e-12 && r2 < lj_cutoff * lj_cutoff {
+            let r = r2.sqrt();
+            let inv = 1.0 / r;
+            let dir = d_oo * inv;
+            let (sigma, eps) = lj_tables.lookup(&LjTableIndices::WaterWater);
+            let (f, e) = force_e_lj(dir, inv, sigma, eps);
+            let f64v: Vec3F64 = f.into();
+            f_wa.f_o += f64v;
+            f_wb.f_o -= f64v;
+            energy += e as f64;
+            *virial_w += d_oo.dot(f) as f64;
+        }
+    }
+
+    // --- Coulomb between charged sites {M, H0, H1} × {M, H0, H1} (O has no charge) ---
+    if !overrides.coulomb_disabled {
+        let sites_a = [
+            (WaterSite::M, wa.m.posit, wa.m.partial_charge),
+            (WaterSite::H0, wa.h0.posit, wa.h0.partial_charge),
+            (WaterSite::H1, wa.h1.posit, wa.h1.partial_charge),
+        ];
+        let sites_b = [
+            (WaterSite::M, wb.m.posit, wb.m.partial_charge),
+            (WaterSite::H0, wb.h0.posit, wb.h0.partial_charge),
+            (WaterSite::H1, wb.h1.posit, wb.h1.partial_charge),
+        ];
+        for (sa, pa, qa) in sites_a {
+            let off_a = pa - o_a;
+            for (sb, pb, qb) in sites_b {
+                let off_b = pb - o_b;
+                let delta = d_oo + off_a - off_b;
+                let r2 = delta.magnitude_squared();
+                if r2 < 1e-12 || r2 >= coulomb_cutoff * coulomb_cutoff {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let inv = 1.0 / r;
+                let dir = delta * inv;
+                let (f, e) =
+                    force_coulomb_short_range(dir, r, inv, qa, qb, coulomb_cutoff, spme_alpha);
+                let f64v: Vec3F64 = f.into();
+                add_water_site_force(f_wa, sa, f64v);
+                add_water_site_force(f_wb, sb, -f64v);
+                energy += e as f64;
+                *virial_w += delta.dot(f) as f64;
+            }
+        }
+    }
+
+    energy
+}
+
+/// Specialized OPC water–solute kernel: O-solute LJ + (M,H0,H1)-solute Coulomb,
+/// one minimum-image displacement per O-solute pair (rigid-offset trick).
+/// `atom_std` is the solute atom; forces on it accumulate into `f_std`, and the
+/// water's per-site forces into `f_wat`. Returns the pair energy (reported — it
+/// IS part of the total, since it involves the solute).
+#[allow(clippy::too_many_arguments)]
+fn f_water_std_cpu(
+    virial_w: &mut f64,
+    f_std: &mut Vec3F64,
+    f_wat: &mut ForcesOnWaterMol,
+    atom_std: &AtomDynamics,
+    w: &WaterMolOpc,
+    cell: &SimBox,
+    lj_tables: &LjTables,
+    overrides: &MdOverrides,
+    spme_alpha: f32,
+    coulomb_cutoff: f32,
+    lj_cutoff: f32,
+    std_idx: usize,
+) -> f64 {
+    let p_std = atom_std.posit;
+    let o_w = w.o.posit;
+    let d_o = cell.min_image(o_w - p_std); // water O relative to solute
+    let mut energy = 0.0f64;
+
+    // --- O(std)–O(water) LJ ---
+    if !overrides.lj_disabled {
+        let r2 = d_o.magnitude_squared();
+        if r2 > 1e-12 && r2 < lj_cutoff * lj_cutoff {
+            let r = r2.sqrt();
+            let inv = 1.0 / r;
+            let dir = d_o * inv;
+            let (sigma, eps) = lj_tables.lookup(&LjTableIndices::StdWater(std_idx));
+            let (f, e) = force_e_lj(dir, inv, sigma, eps);
+            let f64v: Vec3F64 = f.into();
+            // `f` is the force on the water O (tgt of d_o); solute gets the opposite.
+            *f_std -= f64v;
+            f_wat.f_o += f64v;
+            energy += e as f64;
+            *virial_w += d_o.dot(f) as f64;
+        }
+    }
+
+    // --- Coulomb: (M, H0, H1) of water vs solute ---
+    if !overrides.coulomb_disabled {
+        let q_std = atom_std.partial_charge;
+        for (site, ps, qs) in [
+            (WaterSite::M, w.m.posit, w.m.partial_charge),
+            (WaterSite::H0, w.h0.posit, w.h0.partial_charge),
+            (WaterSite::H1, w.h1.posit, w.h1.partial_charge),
+        ] {
+            let off = ps - o_w;
+            let delta = d_o + off; // water site relative to solute
+            let r2 = delta.magnitude_squared();
+            if r2 < 1e-12 || r2 >= coulomb_cutoff * coulomb_cutoff {
+                continue;
+            }
+            let r = r2.sqrt();
+            let inv = 1.0 / r;
+            let dir = delta * inv;
+            let (f, e) = force_coulomb_short_range(dir, r, inv, qs, q_std, coulomb_cutoff, spme_alpha);
+            let f64v: Vec3F64 = f.into();
+            *f_std -= f64v;
+            add_water_site_force(f_wat, site, f64v);
+            energy += e as f64;
+            *virial_w += delta.dot(f) as f64;
+        }
+    }
+
+    energy
 }
 
 fn atom_to_mol_indices(n_atoms: usize, mol_start_indices: &[usize]) -> Vec<usize> {
