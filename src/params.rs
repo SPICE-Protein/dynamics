@@ -530,11 +530,66 @@ pub fn dedup_altloc(mol: &mut MmCif) {
     }
 }
 
+/// Find amino-acid residues whose sidechain heavy atoms are entirely missing
+/// (backbone-only N/CA/C/O). Common in crystal structures with disordered
+/// sidechains, especially N/C-termini and surface loops. Glycine is exempt (it
+/// has no sidechain). Returns (chain id, residue serial, 3-letter name).
+fn find_incomplete_residues(mol: &MmCif) -> Vec<(String, u32, String)> {
+    let mut sn_to_chain: HashMap<u32, String> = HashMap::new();
+    for ch in &mol.chains {
+        for &sn in &ch.atom_sns {
+            sn_to_chain.insert(sn, ch.id.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for r in &mol.residues {
+        let ResidueType::AminoAcid(aa) = &r.res_type else {
+            continue;
+        };
+        if *aa == AminoAcid::Gly {
+            continue;
+        }
+        let mut has_sidechain = false;
+        for &sn in &r.atom_sns {
+            let Some(a) = mol.atoms.iter().find(|a| a.serial_number == sn) else {
+                continue;
+            };
+            if a.element == Element::Hydrogen {
+                continue;
+            }
+            let is_bb = matches!(
+                a.type_in_res,
+                Some(AtomTypeInRes::N | AtomTypeInRes::CA | AtomTypeInRes::C | AtomTypeInRes::O)
+            );
+            if !is_bb {
+                has_sidechain = true;
+                break;
+            }
+        }
+        if !has_sidechain {
+            let chain = sn_to_chain
+                .get(&r.serial_number)
+                .cloned()
+                .unwrap_or_default();
+            let name = aa.to_str(na_seq::AaIdent::ThreeLetters).to_string();
+            out.push((chain, r.serial_number, name));
+        }
+    }
+    out
+}
+
 /// See docs on `prepare_peptide`. This is a convenience variant that uses an `MmCif` file.
+///
+/// `strict_incomplete`: reject structures with residues whose sidechain heavy
+/// atoms are entirely missing (disordered crystal sidechains). Default policy is
+/// strict (`true`): a truncated residue silently corrupts the physics, so the
+/// caller should filter/repair it upstream. Set `false` to build them truncated
+/// (backbone + a single Cα H, with a warning).
 pub fn prepare_peptide_mmcif(
     mol: &mut MmCif,
     ff_map: &ProtFfChargeMapSet,
     ph: f32, // todo: Implement.
+    strict_incomplete: bool,
 ) -> Result<(Vec<BondGeneric>, Vec<Dihedral>), ParamError> {
     let mut dihedrals = Vec::new();
 
@@ -568,6 +623,32 @@ pub fn prepare_peptide_mmcif(
             ch.atom_sns.retain(|sn| !hetero_sns.contains(sn));
             ch.residue_sns.retain(|sn| keep_res.contains(sn));
         }
+    }
+
+    // Reject/flag residues with entirely missing sidechains (disordered crystal
+    // structures; backbone-only N/CA/C/O). Gly is exempt (it has no sidechain).
+    // Strict (default): fail with a clear aggregate error so the caller can
+    // filter/repair upstream — silently truncating a residue corrupts the
+    // physics (missing mass/charge/nonbonded). Lenient: warn and build the
+    // residue backbone-only (single Cα H, no sidechain).
+    let incomplete = find_incomplete_residues(mol);
+    if !incomplete.is_empty() {
+        let list = incomplete
+            .iter()
+            .map(|(c, s, n)| format!("{n} (chain {c}, res {s})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if strict_incomplete {
+            return Err(ParamError::new(&format!(
+                "Incomplete structure: {} residue(s) have no sidechain heavy atoms (backbone only): {list}. \
+                 Filter/repair upstream, or rebuild with strict_incomplete=false to degrade (builds truncated).",
+                incomplete.len()
+            )));
+        }
+        eprintln!(
+            "WARNING: {} residue(s) have no sidechain heavy atoms (backbone only); building truncated: {list}",
+            incomplete.len()
+        );
     }
 
     let h_count = mol

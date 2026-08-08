@@ -692,6 +692,22 @@ fn handle_backbone(
     }
 
     if posits_sc.is_empty() {
+        if *aa != AminoAcid::Gly {
+            // Non-Gly with no sidechain atoms: the structure is missing the
+            // sidechain (disordered crystal residue). In strict mode this is
+            // rejected upstream (prepare_peptide_mmcif pre-flight); in lenient
+            // mode we build a single Cα H named "HA" with best-effort geometry
+            // along the N–Cα–C outward bisector (the sidechain that would
+            // define the tetrahedral 4th direction is absent).
+            let dir = (c_alpha_posit * 2.0 - n_posit - c_p_posit).to_normalized();
+            hydrogens.push(AtomGeneric {
+                posit: c_alpha_posit + dir * LEN_CALPHA_H,
+                type_in_res: Some(AtomTypeInRes::H("HA".to_string())),
+                ..h_default.clone()
+            });
+            return Ok((dihedral, Some((c_p_posit, c_alpha_posit))));
+        }
+
         // This generally means the residue is Glycine, which doesn't have a sidechain.
         // Glycine is unique, having 2 H atoms attached to its Cα. It has correspondingly
         // different HA labels. (HA2 and HA3, vice the plain HA).
