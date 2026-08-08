@@ -446,6 +446,90 @@ pub fn prepare_peptide(
     Ok(dihedrals)
 }
 
+/// Remove alternate-conformer (altloc) duplicates from an `MmCif`.
+///
+/// mmCIF/PDB files represent alternative conformations as separate atoms with
+/// the SAME atom name inside the SAME residue (e.g. residue ARG 14 has `CA`
+/// with altloc "A" and "B"). Keeping both produces two atoms typed `XC` (Cα)
+/// in one residue, and the spurious `XC-N-XC` angle then fails the FF lookup
+/// (`Missing valence angle params for XC-N-XC`).
+/// Standard PDB practice: keep only the highest-occupancy conformer (ties →
+/// lowest serial number / first-listed) and drop the rest, fixing residue and
+/// chain atom references. This also drops the duplicate side-chain atoms of the
+/// discarded conformer (they share atom names with the kept one).
+pub fn dedup_altloc(mol: &mut MmCif) {
+    // Map serial -> chain id so alternate conformers are keyed per chain
+    // (residue serial numbers repeat across chains).
+    let mut sn_to_chain: HashMap<u32, String> = HashMap::new();
+    for ch in &mol.chains {
+        for &sn in &ch.atom_sns {
+            sn_to_chain.insert(sn, ch.id.clone());
+        }
+    }
+
+    // Atom name helper (type_in_res preferred, else general name / element).
+    let name_of = |a: &AtomGeneric| -> String {
+        a.type_in_res
+            .as_ref()
+            .map(|t| t.to_string())
+            .or_else(|| a.type_in_res_general.clone())
+            .unwrap_or_else(|| format!("{:?}", a.element))
+    };
+
+    // For each (chain, residue, atom name): keep the best conformer.
+    #[derive(Clone, Copy)]
+    struct Best {
+        sn: u32,
+        occ: f32,
+    }
+    let mut best: HashMap<(String, u32, String), Best> = HashMap::new();
+    for r in &mol.residues {
+        for &sn in &r.atom_sns {
+            let Some(a) = mol.atoms.iter().find(|a| a.serial_number == sn) else {
+                continue;
+            };
+            let key = (
+                sn_to_chain.get(&sn).cloned().unwrap_or_default(),
+                r.serial_number,
+                name_of(a),
+            );
+            let occ = a.occupancy.unwrap_or(0.0);
+            // Existing entry wins if it has strictly higher occupancy, or equal
+            // occupancy with a lower serial number (first-listed conformer).
+            if !best
+                .get(&key)
+                .is_some_and(|b| b.occ > occ || (b.occ == occ && b.sn < sn))
+            {
+                best.insert(key, Best { sn, occ });
+            }
+        }
+    }
+
+    let before = mol.atoms.len();
+    let keep: std::collections::HashSet<u32> = best.values().map(|b| b.sn).collect();
+    mol.atoms.retain(|a| keep.contains(&a.serial_number));
+    for r in &mut mol.residues {
+        r.atom_sns.retain(|sn| keep.contains(sn));
+    }
+    mol.residues.retain(|r| !r.atom_sns.is_empty());
+    let keep_res: std::collections::HashSet<u32> =
+        mol.residues.iter().map(|r| r.serial_number).collect();
+    for ch in &mut mol.chains {
+        ch.atom_sns.retain(|sn| keep.contains(sn));
+        ch.residue_sns.retain(|sn| keep_res.contains(sn));
+    }
+    mol.chains.retain(|c| !c.atom_sns.is_empty());
+
+    if mol.atoms.len() < before {
+        eprintln!(
+            "dedup_altloc: dropped {} alternate-conformer atoms ({} -> {})",
+            before - mol.atoms.len(),
+            before,
+            mol.atoms.len()
+        );
+    }
+}
+
 /// See docs on `prepare_peptide`. This is a convenience variant that uses an `MmCif` file.
 pub fn prepare_peptide_mmcif(
     mol: &mut MmCif,
@@ -453,6 +537,12 @@ pub fn prepare_peptide_mmcif(
     ph: f32, // todo: Implement.
 ) -> Result<(Vec<BondGeneric>, Vec<Dihedral>), ParamError> {
     let mut dihedrals = Vec::new();
+
+    // Collapse alternate conformations (altloc A/B duplicates) before any
+    // hydrogen addition, FF typing, or bond inference. This is the single choke
+    // point for BOTH the mmCIF path (`Structure.from_mmcif`) and the in-memory
+    // path (`Structure.from_atoms` / parquet), which both funnel through here.
+    dedup_altloc(mol);
 
     // Drop hetero atoms (water, ions, ligands) up front. `MdState::new` filters
     // `!hetero` atoms for peptides, so bonds must be created on the same atom set
