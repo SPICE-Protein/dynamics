@@ -385,6 +385,26 @@ pub fn populate_peptide_ff_and_q(
                             }
                         }
 
+                        // N-terminus: the deposited/structure H on the backbone N is
+                        // usually named "H" (amide style), but the N-term charge map
+                        // (aminont12) expects H1/H2/H3 for the NH3+ ammonium. Map the
+                        // first one to H1 so it types as a proper N-term amine H
+                        // instead of the generic "HB2" (a β-carbon H type).
+                        if !found
+                            && res.end == ResidueEnd::NTerminus
+                            && *type_in_res == AtomTypeInRes::H("H".to_owned())
+                        {
+                            for charge in charges {
+                                if charge.type_in_res == AtomTypeInRes::H("H1".to_string()) {
+                                    atom.force_field_type = Some(charge.ff_type.clone());
+                                    atom.partial_charge = Some(charge.charge);
+
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+
                         // Generic H fallback (only if the variant workarounds above
                         // did not match). We've witnessed unmatched H types due to
                         // errors in mmCIF files, e.g. on ASP #88 on 9GLS.

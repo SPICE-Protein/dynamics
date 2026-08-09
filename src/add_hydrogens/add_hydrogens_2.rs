@@ -688,6 +688,31 @@ fn handle_backbone(
                 ..h_default.clone()
             });
         }
+    } else if aa != &AminoAcid::Pro {
+        // N-terminus (first residue): NH3+ ammonium — 3 H's named H1/H2/H3,
+        // matching aminont12.lib. Placed tetrahedrally around the backbone N,
+        // using the N→CA axis as the reference (the N has only that one heavy
+        // bond). Previously the N-terminus got NO H at all, leaving a bare
+        // amine N with a mismatched charge/geometry.
+        let u = (n_posit - c_alpha_posit).to_normalized(); // N pointing away from CA
+        let v0 = if u.x.abs() < 0.9 {
+            lin_alg::f64::Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            lin_alg::f64::Vec3::new(0.0, 1.0, 0.0)
+        };
+        let v = (v0 - u * v0.dot(u)).to_normalized();
+        let w = u.cross(v);
+        // cos/sin of the tetrahedral angle 109.47°.
+        let (c_th, s_th) = (-1.0 / 3.0, (8.0_f64).sqrt() / 3.0);
+        for (i, hname) in ["H1", "H2", "H3"].iter().enumerate() {
+            let phi = (i as f64) * std::f64::consts::TAU / 3.0;
+            let dir = u * c_th + (v * phi.cos() + w * phi.sin()) * s_th;
+            hydrogens.push(AtomGeneric {
+                posit: n_posit + dir * LEN_N_H,
+                type_in_res: Some(AtomTypeInRes::H(hname.to_string())),
+                ..h_default.clone()
+            });
+        }
     }
 
     // For residues prior to the last.
