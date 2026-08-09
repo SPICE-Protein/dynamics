@@ -132,9 +132,11 @@ fn find_bonded_atoms<'a>(
     atom_i: usize,
 ) -> Vec<(usize, &'a AtomGeneric)> {
     // todo: Adj this len A/R, or calc it per-branch with a fn.
-    // todo 1.80 seems to work well, but causes, for example, the CG - S bond in Met to be missed.
-    // todo: 1.85 works in that case.
-    const BONDED_LEN_THRESH: f64 = 1.85;
+    // Met's C-S bond is ~1.81 Å but crystal strain can stretch it past 1.85 Å
+    // (observed SD-CE = 1.865 on 1XJ3 res 39); 1.9 Å catches real C-S bonds
+    // while staying well below any intra-residue non-bonded heavy-heavy
+    // contact (>2.4 Å even in tight H-bonds).
+    const BONDED_LEN_THRESH: f64 = 1.9;
 
     atoms
         .iter()
@@ -558,13 +560,20 @@ fn add_h_sc_het(
                 }
             }
             Sulfur => {
-                // Thiol (SH): single H when SG has exactly one heavy-atom bond (to CB)
-                // and it is NOT part of a disulfide bridge. A bridged SG has two bonds
-                // (to CB and to the partner SG) and must not get a thiol H — its partner
-                // S occupies that position.
+                // Thiol (SH): single H when a Cys SG has exactly one heavy-atom bond
+                // (to CB) and it is NOT part of a disulfide bridge. A bridged SG has two
+                // bonds (to CB and to the partner SG) and must not get a thiol H — its
+                // partner S occupies that position.
+                // ONLY Cys SG ever carries an H. Met's SD / Sec's SE are thioether
+                // sulfurs — they never get a thiol H, even if a stretched/broken bond
+                // makes them appear single-bonded (e.g. a strained Met SD-CE > 1.85 Å
+                // falling outside the bond threshold).
                 // CYS (protonated) has HG in the digit_map; CYM (deprotonated) does not,
                 // so h_type_in_res_sidechain returns None for CYM and the H is skipped.
-                if atoms_bonded.len() == 1 && !disulfide_sg_sns.contains(&atom.serial_number) {
+                if *parent_tir == AtomTypeInRes::SG
+                    && atoms_bonded.len() == 1
+                    && !disulfide_sg_sns.contains(&atom.serial_number)
+                {
                     let (bond_prev, bond_back2) =
                         match get_prev_bonds(atom, atoms, i, atoms_bonded[0]) {
                             Ok(v) => v,
