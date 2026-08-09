@@ -527,6 +527,25 @@ impl MdState {
             }
 
             a.accel = a.force * self.mass_accel_factor[i];
+            if !(a.accel.x.is_finite() && a.accel.y.is_finite() && a.accel.z.is_finite()) {
+                // Non-finite accel (NaN / ±INF): a diverged trajectory has produced a
+                // non-finite force (e.g. LJ 1/r^12 overflowing f32 at near-zero
+                // separation, or a NaN propagated upstream). The clamp below would turn
+                // ±INF into NaN via `to_normalized()` and silently poison the velocities;
+                // instead we zero this atom and flag the whole system as blown-up
+                // (`potential_energy = NaN`), so the caller reports `crashed` on THIS step
+                // rather than one step later (which would burn another integration round on
+                // garbage forces).
+                a.accel = Vec3::new_zero();
+                a.vel = Vec3::new_zero();
+                if clamped_count == 0 {
+                    clamped_first = i;
+                    clamped_mag = f32::INFINITY;
+                }
+                clamped_count += 1;
+                self.potential_energy = f64::NAN;
+                continue;
+            }
             if a.accel.magnitude_squared() > MAX_ACCEL_SQ {
                 if clamped_count == 0 {
                     clamped_first = i;
@@ -542,8 +561,13 @@ impl MdState {
         if clamped_count > 0
             && !(self.solvent_only_sim_at_init && self.cfg.solvent == Solvent::OctanolWithWater)
         {
+            let why = if clamped_mag.is_infinite() {
+                "non-finite accel (NaN/INF)"
+            } else {
+                "accel clamp"
+            };
             println!(
-                "Warn: {clamped_count} atom(s) hit accel clamp on step {}, first atom {clamped_first} ({clamped_mag:.0} -> {MAX_ACCEL:.0})",
+                "Warn: {clamped_count} atom(s) hit {why} on step {}, first atom {clamped_first} ({clamped_mag:.0} -> {MAX_ACCEL:.0})",
                 self.step_count
             );
         }
@@ -556,6 +580,30 @@ impl MdState {
             w.o.accel = w.o.force * ACCEL_CONV_WATER_O;
             w.h0.accel = w.h0.force * ACCEL_CONV_WATER_H;
             w.h1.accel = w.h1.force * ACCEL_CONV_WATER_H;
+
+            if !(w.o.accel.x.is_finite()
+                && w.o.accel.y.is_finite()
+                && w.o.accel.z.is_finite()
+                && w.h0.accel.x.is_finite()
+                && w.h0.accel.y.is_finite()
+                && w.h0.accel.z.is_finite()
+                && w.h1.accel.x.is_finite()
+                && w.h1.accel.y.is_finite()
+                && w.h1.accel.z.is_finite())
+            {
+                // Same non-finite guard as the solute loop. Rigid water has no
+                // MAX_ACCEL clamp, so this is the only defense against a water
+                // site receiving a non-finite kick (which would otherwise fly
+                // across the box and destabilize everything around it).
+                w.o.accel = Vec3::new_zero();
+                w.h0.accel = Vec3::new_zero();
+                w.h1.accel = Vec3::new_zero();
+                w.o.vel = Vec3::new_zero();
+                w.h0.vel = Vec3::new_zero();
+                w.h1.vel = Vec3::new_zero();
+                self.potential_energy = f64::NAN;
+                continue;
+            }
 
             w.o.vel += w.o.accel * dt;
             w.h0.vel += w.h0.accel * dt;
