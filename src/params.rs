@@ -337,6 +337,16 @@ pub fn populate_peptide_ff_and_q(
                     // todo when we create them. For now, this meets the intent.
                     AtomTypeInRes::H(_) => {
                         // todo: This is a workaround for the above; try other HIS variants.
+                        // A HIS ring H can be named per a DIFFERENT protonation
+                        // variant than the default one used for typing (e.g. an
+                        // "HE2" H — HIE pattern — while the residue is typed via
+                        // the HID variant at pH ~7). Try the sibling variant.
+                        //
+                        // NOTE: do NOT `break` out of the outer residue-atom loop
+                        // here — `break` targets the nearest enclosing loop, which
+                        // silently skips every subsequent atom of the residue
+                        // (leaving them untyped → "Atom missing FF type"). Guard
+                        // the remaining fallbacks with `!found` instead.
                         if aa_gen == AminoAcidGeneral::Standard(AminoAcid::His) {
                             let charges = charge_map
                                 .get(&AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Hie))
@@ -356,14 +366,12 @@ pub fn populate_peptide_ff_and_q(
                                     break;
                                 }
                             }
-                            if found {
-                                break;
-                            }
                         }
 
                         // The amber template doesn't have HH23; only 2 Hs on that. I believe
                         // this may be an omission.
-                        if aa_gen == AminoAcidGeneral::Standard(AminoAcid::Arg)
+                        if !found
+                            && aa_gen == AminoAcidGeneral::Standard(AminoAcid::Arg)
                             && *type_in_res == AtomTypeInRes::H("HH23".to_owned())
                         {
                             for charge in charges {
@@ -375,27 +383,28 @@ pub fn populate_peptide_ff_and_q(
                                     break;
                                 }
                             }
-                            if found {
-                                break;
-                            }
                         }
 
-                        // Note: We've witnessed this due to errors in the mmCIF file, e.g. on ASP #88 on 9GLS.
-                        eprintln!(
-                            "Error assigning FF type and q based on atom type in res: Failed to match H type. Res #{}, Atom #{}, {type_in_res}, {aa_gen:?}. \
-                         Falling back to a generic H",
-                            res.serial_number, atom.serial_number,
-                        );
+                        // Generic H fallback (only if the variant workarounds above
+                        // did not match). We've witnessed unmatched H types due to
+                        // errors in mmCIF files, e.g. on ASP #88 on 9GLS.
+                        if !found {
+                            eprintln!(
+                                "Error assigning FF type and q based on atom type in res: Failed to match H type. Res #{}, Atom #{}, {type_in_res}, {aa_gen:?}. \
+                             Falling back to a generic H",
+                                res.serial_number, atom.serial_number,
+                            );
 
-                        for charge in charges {
-                            if charge.type_in_res == AtomTypeInRes::H("H".to_string())
-                                || charge.type_in_res == AtomTypeInRes::H("HA".to_string())
-                            {
-                                atom.force_field_type = Some("HB2".to_string());
-                                atom.partial_charge = Some(charge.charge);
+                            for charge in charges {
+                                if charge.type_in_res == AtomTypeInRes::H("H".to_string())
+                                    || charge.type_in_res == AtomTypeInRes::H("HA".to_string())
+                                {
+                                    atom.force_field_type = Some("HB2".to_string());
+                                    atom.partial_charge = Some(charge.charge);
 
-                                found = true;
-                                break;
+                                    found = true;
+                                    break;
+                                }
                             }
                         }
                     }
