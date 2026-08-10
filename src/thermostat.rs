@@ -344,6 +344,9 @@ impl MdState {
         }
 
         for w in &mut self.water {
+            if self.cfg.overrides.skip_water_thermostat {
+                continue;
+            }
             let (ox, oy, oz): (f32, f32, f32) = (
                 self.barostat.rng.sample(StandardNormal),
                 self.barostat.rng.sample(StandardNormal),

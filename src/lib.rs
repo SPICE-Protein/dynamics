@@ -609,6 +609,10 @@ pub struct MdOverrides {
     pub coulomb_disabled: bool,
     pub lj_disabled: bool,
     pub long_range_recip_disabled: bool,
+    /// Diagnostics: skip the Langevin thermostat's noise/friction on RIGID WATER
+    /// (diagnose whether the per-atom 9-component water noise + SETTLE projection
+    /// is responsible for the ~+70 K thermostat-equilibrium offset).
+    pub skip_water_thermostat: bool,
     /// Run this block if we wish to, for dev purposes, take snapshots during the
     /// solvent equilibration phase, e.g. for tuning it.
     pub snapshots_during_equilibration: bool,
