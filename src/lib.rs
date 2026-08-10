@@ -208,7 +208,15 @@ const CENTER_SIMBOX_RATIO: usize = 30;
 
 // Run SPME once every these steps. It's the slowest computation, and is comparatively
 // smooth over time compared to Coulomb and LJ.
-const SPME_RATIO: usize = 2;
+//
+// MUST stay 1: with SPME_RATIO=2 the reciprocal-space forces/energy are cached on
+// the SPME step and reused on the off-step, but the atoms have already moved —
+// applying a force computed at STALE positions breaks the symplectic structure and
+// injects energy. Measured on 2LYZ in NVE (no thermostat): total energy climbs
+// +7.4 kcal/mol/step with the cache, vs +0.85 (≈ noise) with long-range recip
+// disabled. Computing SPME every step is the robust fix; a correct cache would need
+// reference-position compensation. LAMMPS also computes kspace every step by default.
+const SPME_RATIO: usize = 1;
 
 // todo: This may not be necessary, other than having it be a multiple of SPME_RATIO.
 // todo: This is because the recording is very fast. (ns order)
