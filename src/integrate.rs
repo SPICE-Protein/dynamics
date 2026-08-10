@@ -9,16 +9,21 @@ use std::{
 #[cfg(feature = "encode")]
 use bincode::{Decode, Encode};
 use lin_alg::f32::Vec3;
+use rand::RngExt;
+use rand_distr::StandardNormal;
 
 use crate::{
     CENTER_SIMBOX_RATIO, COMPUTATION_TIME_RATIO, ComMotionRemoval, ComputationDevice,
-    HydrogenConstraint, MdState, Solvent,
+    HydrogenConstraint, KCAL_TO_NATIVE, MdState, Solvent,
     barostat::measure_pressure,
     solvent::{
         ACCEL_CONV_WATER_H, ACCEL_CONV_WATER_O,
         opc_settle::{RESET_ANGLE_RATIO, integrate_rigid_water, reset_angle},
     },
-    thermostat::{LANGEVIN_GAMMA_DEFAULT, LANGEVIN_GAMMA_WATER_INIT, TAU_TEMP_WATER_INIT},
+    thermostat::{
+        KB_A2_PS2_PER_K_PER_AMU, LANGEVIN_GAMMA_DEFAULT, LANGEVIN_GAMMA_WATER_INIT,
+        TAU_TEMP_WATER_INIT,
+    },
 };
 
 // The maximum allowed acceleration, in Å/ps^2.
@@ -118,18 +123,16 @@ impl MdState {
                     start = Instant::now();
                 }
 
-                if !self.solvent_only_sim_at_init {
-                    self.apply_langevin_thermostat(dt, gamma, self.cfg.temp_target);
-                    // Update KE after vel updates from the thermostat, prior to barostat.
-                    self.kinetic_energy = self.measure_kinetic_energy();
-                } else if self.solvent_only_sim_at_init {
-                    self.apply_langevin_thermostat(
-                        dt,
-                        LANGEVIN_GAMMA_WATER_INIT,
-                        self.cfg.temp_target,
-                    );
-                    self.kinetic_energy = self.measure_kinetic_energy();
-                }
+                // LAMMPS-style force-based Langevin is applied inside
+                // kick_and_calc_accel (friction + noise added to the accel,
+                // integrated through the velocity Verlet's two half-kicks), so
+                // there is no mid-step velocity OU here. The old mid-step OU
+                // (c = exp(-gamma dt)) was miscalibrated: NVT equilibrium sat
+                // ~+70 K above target. `gamma` is read again in
+                // kick_and_calc_accel from self.cfg.integrator.
+                let _ = gamma;
+                // Refresh KE for the barostat / pressure calc.
+                self.kinetic_energy = self.measure_kinetic_energy();
 
                 // Rattle after the thermostat run, as it updates velocities in a non-uniform manner.
                 if matches!(
@@ -519,6 +522,24 @@ impl MdState {
     /// Half kick for non-solvent and solvent. We call this one or more time
     /// in the various integration approaches. Updates kinetic energy.
     fn kick_and_calc_accel(&mut self, dt: f32) {
+        // LAMMPS-style force-based Langevin (friction + noise as an acceleration
+        // term, integrated through the velocity Verlet). The old mid-step OU
+        // velocity update was miscalibrated (~+70 K NVT equilibrium offset); the
+        // force-based form is the canonical MD Langevin (LAMMPS fix_langevin).
+        // Noise variance per component: 2·gamma·kBT/(m·dt_step).
+        let langevin: Option<(f32, f32)> = match self.cfg.integrator {
+            Integrator::LangevinMiddle { gamma } => {
+                let g = if self.solvent_only_sim_at_init {
+                    LANGEVIN_GAMMA_WATER_INIT
+                } else {
+                    gamma
+                };
+                Some((g, 2.0 * dt)) // full step = 2·half-kick
+            }
+            _ => None,
+        };
+        let kbt = KB_A2_PS2_PER_K_PER_AMU * self.cfg.temp_target;
+
         // Rate-limit the clamp diagnostics: print once per step with a count,
         // instead of one line per atom — otherwise the log floods when many
         // atoms hit the bound (e.g. during stability scans at non-physiological
@@ -559,6 +580,16 @@ impl MdState {
                 }
                 clamped_count += 1;
                 a.accel = a.accel.to_normalized() * MAX_ACCEL;
+            }
+
+            // LAMMPS-style Langevin on this atom: accel += -gamma·v + noise.
+            if let Some((gamma, dt_step)) = langevin {
+                let m_inv = self.mass_accel_factor[i] / KCAL_TO_NATIVE;
+                let s = (2.0 * gamma * kbt * m_inv / dt_step).max(0.0).sqrt();
+                let nx: f32 = self.barostat.rng.sample(StandardNormal);
+                let ny: f32 = self.barostat.rng.sample(StandardNormal);
+                let nz: f32 = self.barostat.rng.sample(StandardNormal);
+                a.accel += a.vel * (-gamma) + Vec3::new(nx * s, ny * s, nz * s);
             }
 
             a.vel += a.accel * dt;
@@ -615,6 +646,33 @@ impl MdState {
                 w.h1.vel = Vec3::new_zero();
                 self.potential_energy = f64::NAN;
                 continue;
+            }
+
+            // LAMMPS-style Langevin on the rigid water's three atoms (SETTLE
+            // projection in drift() then re-imposes rigidity).
+            if let Some((gamma, dt_step)) = langevin {
+                let m_inv_o = ACCEL_CONV_WATER_O / KCAL_TO_NATIVE;
+                let m_inv_h = ACCEL_CONV_WATER_H / KCAL_TO_NATIVE;
+                let s_o = (2.0 * gamma * kbt * m_inv_o / dt_step).max(0.0).sqrt();
+                let s_h = (2.0 * gamma * kbt * m_inv_h / dt_step).max(0.0).sqrt();
+                let (ox, oy, oz): (f32, f32, f32) = (
+                    self.barostat.rng.sample(StandardNormal),
+                    self.barostat.rng.sample(StandardNormal),
+                    self.barostat.rng.sample(StandardNormal),
+                );
+                let (h0x, h0y, h0z): (f32, f32, f32) = (
+                    self.barostat.rng.sample(StandardNormal),
+                    self.barostat.rng.sample(StandardNormal),
+                    self.barostat.rng.sample(StandardNormal),
+                );
+                let (h1x, h1y, h1z): (f32, f32, f32) = (
+                    self.barostat.rng.sample(StandardNormal),
+                    self.barostat.rng.sample(StandardNormal),
+                    self.barostat.rng.sample(StandardNormal),
+                );
+                w.o.accel += w.o.vel * (-gamma) + Vec3::new(ox * s_o, oy * s_o, oz * s_o);
+                w.h0.accel += w.h0.vel * (-gamma) + Vec3::new(h0x * s_h, h0y * s_h, h0z * s_h);
+                w.h1.accel += w.h1.vel * (-gamma) + Vec3::new(h1x * s_h, h1y * s_h, h1z * s_h);
             }
 
             w.o.vel += w.o.accel * dt;

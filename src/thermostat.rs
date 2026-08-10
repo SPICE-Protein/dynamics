@@ -318,6 +318,11 @@ impl MdState {
 
     /// A thermostat that integrates the stochastic Langevin equation. Good temperature control
     /// and ergodicity, but the friction parameter damps real dynamics as it grows. This applies an OU update.
+    ///
+    /// SUPERSEDED: replaced by the LAMMPS-style force-based Langevin applied in
+    /// `kick_and_calc_accel` (integrate.rs), which fixes the ~+70 K equilibrium
+    /// offset of this mid-step OU formulation. Kept only as reference.
+    #[allow(dead_code)]
     pub(crate) fn apply_langevin_thermostat(&mut self, dt: f32, gamma: f32, temp_tgt_k: f32) {
         let c = (-gamma * dt).exp();
         let s2 = (1.0 - c * c).max(0.0); // numerical guard
