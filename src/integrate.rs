@@ -8,7 +8,7 @@ use std::{
 
 #[cfg(feature = "encode")]
 use bincode::{Decode, Encode};
-use lin_alg::f32::Vec3;
+use lin_alg::f32::{Mat3 as Mat3F32, Vec3};
 use rand::RngExt;
 use rand_distr::StandardNormal;
 
@@ -17,7 +17,7 @@ use crate::{
     HydrogenConstraint, KCAL_TO_NATIVE, MdState, Solvent,
     barostat::measure_pressure,
     solvent::{
-        ACCEL_CONV_WATER_H, ACCEL_CONV_WATER_O,
+        ACCEL_CONV_WATER_H, ACCEL_CONV_WATER_O, H_MASS, O_MASS,
         opc_settle::{RESET_ANGLE_RATIO, integrate_rigid_water, reset_angle},
     },
     thermostat::{
@@ -648,38 +648,89 @@ impl MdState {
                 continue;
             }
 
-            // LAMMPS-style Langevin on the rigid water's three atoms (SETTLE
-            // projection in drift() then re-imposes rigidity). `skip_water_thermostat`
-            // lets the caller run solute-only thermostatting (a diagnostic: with
-            // per-atom noise on rigid water the NVT equilibrium runs ~+70 K hot;
-            // solute-only sits at target).
+            // Rigid-body Langevin on the water's 6 physical DOF (COM translation
+            // with total mass M + rigid rotation about COM with inertia I), the
+            // LAMMPS/GROMACS standard for rigid solvent. Per-atom 9-component
+            // noise over-injects into the 3 SETTLE-constrained DOF: measured on
+            // 2LYZ the per-atom path kept WATER ~404 K (target 310) while the
+            // solute thermostat sank to ~253 K as the heat sink — the exact
+            // over-injection signature. Thermostatting COM + rotation gives each
+            // of the 6 physical DOF exactly ½·kBT.
             if let Some((gamma, dt_step)) = langevin {
-                if self.cfg.overrides.skip_water_thermostat {
-                    // Still apply friction to water (it damps), but skip the noise,
-                    // which is what over-injects energy into the 3 constrained DOF.
-                } else {
-                let m_inv_o = ACCEL_CONV_WATER_O / KCAL_TO_NATIVE;
-                let m_inv_h = ACCEL_CONV_WATER_H / KCAL_TO_NATIVE;
-                let s_o = (2.0 * gamma * kbt * m_inv_o / dt_step).max(0.0).sqrt();
-                let s_h = (2.0 * gamma * kbt * m_inv_h / dt_step).max(0.0).sqrt();
-                let (ox, oy, oz): (f32, f32, f32) = (
-                    self.barostat.rng.sample(StandardNormal),
-                    self.barostat.rng.sample(StandardNormal),
-                    self.barostat.rng.sample(StandardNormal),
-                );
-                let (h0x, h0y, h0z): (f32, f32, f32) = (
-                    self.barostat.rng.sample(StandardNormal),
-                    self.barostat.rng.sample(StandardNormal),
-                    self.barostat.rng.sample(StandardNormal),
-                );
-                let (h1x, h1y, h1z): (f32, f32, f32) = (
-                    self.barostat.rng.sample(StandardNormal),
-                    self.barostat.rng.sample(StandardNormal),
-                    self.barostat.rng.sample(StandardNormal),
-                );
-                w.o.accel += w.o.vel * (-gamma) + Vec3::new(ox * s_o, oy * s_o, oz * s_o);
-                w.h0.accel += w.h0.vel * (-gamma) + Vec3::new(h0x * s_h, h0y * s_h, h0z * s_h);
-                w.h1.accel += w.h1.vel * (-gamma) + Vec3::new(h1x * s_h, h1y * s_h, h1z * s_h);
+                if !self.cfg.overrides.skip_water_thermostat {
+                    let m_total = O_MASS + 2.0 * H_MASS;
+                    let r_com = (w.o.posit * O_MASS + w.h0.posit * H_MASS + w.h1.posit * H_MASS)
+                        / m_total;
+                    // Current COM velocity and angular momentum about COM.
+                    let v_com =
+                        (w.o.vel * O_MASS + w.h0.vel * H_MASS + w.h1.vel * H_MASS) / m_total;
+                    let r_o = w.o.posit - r_com;
+                    let r_h0 = w.h0.posit - r_com;
+                    let r_h1 = w.h1.posit - r_com;
+                    let v_o = w.o.vel - v_com;
+                    let v_h0 = w.h0.vel - v_com;
+                    let v_h1 = w.h1.vel - v_com;
+                    let l = r_o.cross(v_o) * O_MASS
+                        + r_h0.cross(v_h0) * H_MASS
+                        + r_h1.cross(v_h1) * H_MASS;
+
+                    // Inertia tensor about COM.
+                    let inertia = |r: Vec3, mass: f32| {
+                        let r2 = r.dot(r);
+                        [
+                            [mass * (r2 - r.x * r.x), -mass * r.x * r.y, -mass * r.x * r.z],
+                            [-mass * r.y * r.x, mass * (r2 - r.y * r.y), -mass * r.y * r.z],
+                            [-mass * r.z * r.x, -mass * r.z * r.y, mass * (r2 - r.z * r.z)],
+                        ]
+                    };
+                    let mut i_arr = inertia(r_o, O_MASS);
+                    for add in [inertia(r_h0, H_MASS), inertia(r_h1, H_MASS)] {
+                        for i in 0..3 {
+                            for j in 0..3 {
+                                i_arr[i][j] += add[i][j];
+                            }
+                        }
+                    }
+                    let i_mat = Mat3F32::from_arr(i_arr);
+                    let (eigvecs, eigvals) = i_mat.eigen_vecs_vals();
+
+                    // COM Langevin (3 translational DOF, mass M):
+                    //   a_com = -γ·V_com + N(0, √(2γ·kBT/(M·dt)))
+                    let s_com = (2.0 * gamma * kbt / (m_total * dt_step)).max(0.0).sqrt();
+                    let (cx, cy, cz): (f32, f32, f32) = (
+                        self.barostat.rng.sample(StandardNormal),
+                        self.barostat.rng.sample(StandardNormal),
+                        self.barostat.rng.sample(StandardNormal),
+                    );
+                    let a_com = Vec3::new(cx * s_com, cy * s_com, cz * s_com) - v_com * gamma;
+
+                    // Rotational Langevin on angular momentum, principal frame
+                    // (3 rotational DOF): dL/dt = -γ·L + noise, noise std per
+                    // principal axis √(2γ·kBT·I_i/dt); rotate back to lab with
+                    // the eigenvector matrix; ω-accel = I⁻¹·(dL/dt).
+                    let (nx, ny, nz): (f32, f32, f32) = (
+                        self.barostat.rng.sample(StandardNormal),
+                        self.barostat.rng.sample(StandardNormal),
+                        self.barostat.rng.sample(StandardNormal),
+                    );
+                    let noise_p = Vec3::new(
+                        nx * (2.0 * gamma * kbt * eigvals.x.max(1e-6) / dt_step)
+                            .max(0.0)
+                            .sqrt(),
+                        ny * (2.0 * gamma * kbt * eigvals.y.max(1e-6) / dt_step)
+                            .max(0.0)
+                            .sqrt(),
+                        nz * (2.0 * gamma * kbt * eigvals.z.max(1e-6) / dt_step)
+                            .max(0.0)
+                            .sqrt(),
+                    );
+                    let d_l = l * (-gamma) + eigvecs * noise_p;
+                    let a_rot = i_mat.solve_system(d_l);
+
+                    // Per-atom accel = a_com + a_rot × r_i (adds to force accel).
+                    w.o.accel += a_com + a_rot.cross(r_o);
+                    w.h0.accel += a_com + a_rot.cross(r_h0);
+                    w.h1.accel += a_com + a_rot.cross(r_h1);
                 }
             }
 
