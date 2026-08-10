@@ -470,6 +470,12 @@ impl MdState {
         if self.cfg.overrides.snapshots_during_equilibration && self.solvent_only_sim_at_init {
             self.handle_snapshots(pressure as f32);
         }
+
+        // Record the instantaneous kinetic temperature at the end of the step,
+        // so applications can verify the thermostat actually reaches the target
+        // temperature (a too-weak Langevin coupling would keep T_kin ≈ 298 K
+        // even when `temp_target` is 380 K).
+        self.last_temperature_k = self.measure_temperature() as f32;
     }
 
     /// Half kick and drift for non-solvent and solvent. We call this one or more time
@@ -571,6 +577,12 @@ impl MdState {
                 self.step_count
             );
         }
+
+        // Expose the clamp metrics as observables on the state, so callers can
+        // detect sustained force spikes (e.g. from thermal kicks at high T) even
+        // though the clamp itself keeps the trajectory alive.
+        self.last_clamped_count = clamped_count;
+        self.last_clamped_mag = clamped_mag;
 
         for w in &mut self.water {
             // Take the force on M/EP, and instead apply it to the other atoms. This leaves it at 0.

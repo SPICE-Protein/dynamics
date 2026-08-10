@@ -663,6 +663,18 @@ pub struct MdState {
     pub potential_energy_nonbonded: f64,
     /// E.g. energy in covalent bonds, as modelled as oscillators.
     pub potential_energy_bonded: f64,
+    /// Count of atoms whose acceleration hit the MAX_ACCEL clamp (or a non-finite
+    /// guard) on the last integration step, and the largest pre-clamp magnitude
+    /// (Å/ps²). Stored so applications can expose them as observables: sustained
+    /// clamps mean force spikes (e.g. thermal kicks at high T) are being swallowed
+    /// by the clamp instead of relaxing through bonded geometry.
+    pub last_clamped_count: usize,
+    pub last_clamped_mag: f32,
+    /// Instantaneous kinetic temperature (K) at the end of the last step:
+    /// T = (2/3)·KE/(N·kB). Lets the caller verify the thermostat actually reaches
+    /// the target temperature — a too-weak Langevin coupling keeps T_kin ≈ 298 K
+    /// even when `temp_target` is 380 K.
+    pub last_temperature_k: f32,
     /// Every so many snapshots, write these to file, then clear from memory.
     /// Used to track which molecule each atom is associated with in our flattened structures.
     /// This is the potential energy between every pair of molecules.
