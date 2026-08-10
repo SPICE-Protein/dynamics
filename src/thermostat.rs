@@ -323,8 +323,6 @@ impl MdState {
         let s2 = (1.0 - c * c).max(0.0); // numerical guard
 
         let sigma_num = KB_A2_PS2_PER_K_PER_AMU * temp_tgt_k * s2;
-        let sigma_o = (sigma_num / O_MASS).sqrt();
-        let sigma_h = (sigma_num / H_MASS).sqrt();
 
         for a in &mut self.atoms {
             if a.static_ {
@@ -347,33 +345,72 @@ impl MdState {
             if self.cfg.overrides.skip_water_thermostat {
                 continue;
             }
-            let (ox, oy, oz): (f32, f32, f32) = (
-                self.barostat.rng.sample(StandardNormal),
-                self.barostat.rng.sample(StandardNormal),
-                self.barostat.rng.sample(StandardNormal),
-            );
-            let (h0x, h0y, h0z): (f32, f32, f32) = (
-                self.barostat.rng.sample(StandardNormal),
-                self.barostat.rng.sample(StandardNormal),
-                self.barostat.rng.sample(StandardNormal),
-            );
-            let (h1x, h1y, h1z): (f32, f32, f32) = (
-                self.barostat.rng.sample(StandardNormal),
-                self.barostat.rng.sample(StandardNormal),
-                self.barostat.rng.sample(StandardNormal),
-            );
 
-            w.o.vel.x = c * w.o.vel.x + sigma_o * ox;
-            w.o.vel.y = c * w.o.vel.y + sigma_o * oy;
-            w.o.vel.z = c * w.o.vel.z + sigma_o * oz;
+            // --- Rigid-body Langevin (correct for constrained water) ---
+            // The previous code applied an independent 9-component OU noise to
+            // each water atom (O, H0, H1) and let SETTLE project to 6 DOF. That
+            // is NOT energy-balanced for the rotational modes: measured on 2LYZ
+            // the NVT equilibrium sat ~+70 K above target (turning the water
+            // thermostat off drops it back to target). Proper constrained MD
+            // (GROMACS / OpenMM / LAMMPS rigid bodies) applies the thermostat
+            // to the 6 physical DOF: COM translation (mass M) + rotation
+            // (inertia tensor I).
+            let mass_total = O_MASS + 2.0 * H_MASS;
 
-            w.h0.vel.x = c * w.h0.vel.x + sigma_h * h0x;
-            w.h0.vel.y = c * w.h0.vel.y + sigma_h * h0y;
-            w.h0.vel.z = c * w.h0.vel.z + sigma_h * h0z;
+            let r_com =
+                (w.o.posit * O_MASS + w.h0.posit * H_MASS + w.h1.posit * H_MASS) / mass_total;
+            let v_com = (w.o.vel * O_MASS + w.h0.vel * H_MASS + w.h1.vel * H_MASS) / mass_total;
 
-            w.h1.vel.x = c * w.h1.vel.x + sigma_h * h1x;
-            w.h1.vel.y = c * w.h1.vel.y + sigma_h * h1y;
-            w.h1.vel.z = c * w.h1.vel.z + sigma_h * h1z;
+            let r_o = w.o.posit - r_com;
+            let r_h0 = w.h0.posit - r_com;
+            let r_h1 = w.h1.posit - r_com;
+
+            // Inertia tensor about COM.
+            let inertia = |r: Vec3, mass: f32| {
+                let r2 = r.dot(r);
+                [
+                    [mass * (r2 - r.x * r.x), -mass * r.x * r.y, -mass * r.x * r.z],
+                    [-mass * r.y * r.x, mass * (r2 - r.y * r.y), -mass * r.y * r.z],
+                    [-mass * r.z * r.x, -mass * r.z * r.y, mass * (r2 - r.z * r.z)],
+                ]
+            };
+            let mut inertia_arr = inertia(r_o, O_MASS);
+            for added in [inertia(r_h0, H_MASS), inertia(r_h1, H_MASS)] {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        inertia_arr[i][j] += added[i][j];
+                    }
+                }
+            }
+            let inertia_mat = Mat3F32::from_arr(inertia_arr);
+            let (eigvecs, eigvals) = inertia_mat.eigen_vecs_vals();
+
+            // OU on COM velocity (3 DOF, mass M).
+            let sigma_com = (sigma_num / mass_total).sqrt();
+            let v_com_new = v_com * c + sample_normal_vec(&mut self.barostat.rng, sigma_com);
+
+            // OU on angular momentum in the principal frame: noise std per
+            // principal axis = sqrt(kBT·s2·I_i) so that E[L Lᵀ] → kBT·I and the
+            // 3 rotational DOF carry 0.5·kBT each at equilibrium.
+            let l_o = r_o.cross(w.o.vel - v_com) * O_MASS;
+            let l_h0 = r_h0.cross(w.h0.vel - v_com) * H_MASS;
+            let l_h1 = r_h1.cross(w.h1.vel - v_com) * H_MASS;
+            let l = l_o + l_h0 + l_h1;
+            let nx: f32 = self.barostat.rng.sample(StandardNormal);
+            let ny: f32 = self.barostat.rng.sample(StandardNormal);
+            let nz: f32 = self.barostat.rng.sample(StandardNormal);
+            let n_l = Vec3::new(
+                nx * (sigma_num * eigvals.x.max(0.0)).sqrt(),
+                ny * (sigma_num * eigvals.y.max(0.0)).sqrt(),
+                nz * (sigma_num * eigvals.z.max(0.0)).sqrt(),
+            );
+            let l_new = l * c + eigvecs * n_l; // noise drawn in principal frame
+            let omega_new = inertia_mat.solve_system(l_new); // ω' = I⁻¹ L'
+
+            w.o.vel = v_com_new + omega_new.cross(r_o);
+            w.h0.vel = v_com_new + omega_new.cross(r_h0);
+            w.h1.vel = v_com_new + omega_new.cross(r_h1);
+            w.update_virtual_site();
         }
     }
 }
