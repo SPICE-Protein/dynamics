@@ -649,8 +649,15 @@ impl MdState {
             }
 
             // LAMMPS-style Langevin on the rigid water's three atoms (SETTLE
-            // projection in drift() then re-imposes rigidity).
+            // projection in drift() then re-imposes rigidity). `skip_water_thermostat`
+            // lets the caller run solute-only thermostatting (a diagnostic: with
+            // per-atom noise on rigid water the NVT equilibrium runs ~+70 K hot;
+            // solute-only sits at target).
             if let Some((gamma, dt_step)) = langevin {
+                if self.cfg.overrides.skip_water_thermostat {
+                    // Still apply friction to water (it damps), but skip the noise,
+                    // which is what over-injects energy into the 3 constrained DOF.
+                } else {
                 let m_inv_o = ACCEL_CONV_WATER_O / KCAL_TO_NATIVE;
                 let m_inv_h = ACCEL_CONV_WATER_H / KCAL_TO_NATIVE;
                 let s_o = (2.0 * gamma * kbt * m_inv_o / dt_step).max(0.0).sqrt();
@@ -673,6 +680,7 @@ impl MdState {
                 w.o.accel += w.o.vel * (-gamma) + Vec3::new(ox * s_o, oy * s_o, oz * s_o);
                 w.h0.accel += w.h0.vel * (-gamma) + Vec3::new(h0x * s_h, h0y * s_h, h0z * s_h);
                 w.h1.accel += w.h1.vel * (-gamma) + Vec3::new(h1x * s_h, h1y * s_h, h1z * s_h);
+                }
             }
 
             w.o.vel += w.o.accel * dt;
