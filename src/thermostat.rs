@@ -250,6 +250,19 @@ impl MdState {
         result.saturating_sub(num_constraints)
     }
 
+    /// The DOF count currently cached for temperature / kinetic-energy
+    /// calculations (exposed for diagnostics / calibration checks).
+    pub fn thermo_dof(&self) -> usize {
+        self.thermo_dof
+    }
+
+    /// Recompute DOF from the CURRENT atoms/solvent/constraints — for
+    /// calibration checks: compare against `thermo_dof()` to catch a stale
+    /// cache (e.g. if atoms/H/ions were added after `MdState::new`).
+    pub fn dof_for_thermo_now(&self) -> usize {
+        self.dof_for_thermo()
+    }
+
     /// Canonical Sampling through Velocities Rescaling thermostat. (Also known as Bussi, its
     /// primary author)
     /// [CSVR thermostat](https://arxiv.org/pdf/0803.4060)
