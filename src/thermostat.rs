@@ -43,6 +43,16 @@ fn sample_normal_vec(rng: &mut StdRng, sigma: f32) -> Vec3 {
 impl MdState {
     /// Computes total kinetic energy, in native units.
     /// Includes all non-static atoms, including solvent.
+    ///
+    /// RIGID-WATER CORRECTION (2026-08-10): the solvent KE is computed as the
+    /// RIGID-BODY kinetic energy (COM translation + rotation about COM), NOT
+    /// the per-atom sum over O/H0/H1. The per-atom sum includes the transient
+    /// internal-mode velocity (O–H stretch / H–O–H angle) that the SETTLE
+    /// constraint force creates during the half-kick and projects away at the
+    /// next drift. Measured against the 6-DOF-per-water count that transient
+    /// inflated the reported temperature by ~+75 K (2LYZ: reported 385 K while
+    /// the water's rigid 6 DOF were correctly at 310 K). GROMACS likewise takes
+    /// temperature from post-constraint (projected) velocities.
     pub(crate) fn measure_kinetic_energy(&self) -> f64 {
         let mut result = 0.0;
 
@@ -52,11 +62,43 @@ impl MdState {
             }
         }
 
-        // Do not include the M/EP site.
+        // Do not include the M/EP site. Solvent contributes its rigid-body KE:
+        //   KE = ½·M·|V_com|² + ½·ωᵀ·I·ω = ½·(M·V_com² + L·ω)
+        // (L = I·ω). We accumulate M·V² + L·ω below; the final ×½ handles it.
         for w in &self.water {
-            result += (w.o.mass * w.o.vel.magnitude_squared()) as f64;
-            result += (w.h0.mass * w.h0.vel.magnitude_squared()) as f64;
-            result += (w.h1.mass * w.h1.vel.magnitude_squared()) as f64;
+            let m_o = w.o.mass;
+            let m_h0 = w.h0.mass;
+            let m_h1 = w.h1.mass;
+            let m_total = m_o + m_h0 + m_h1;
+            let r_com = (w.o.posit * m_o + w.h0.posit * m_h0 + w.h1.posit * m_h1) / m_total;
+            let v_com = (w.o.vel * m_o + w.h0.vel * m_h0 + w.h1.vel * m_h1) / m_total;
+
+            let (r_o, r_h0, r_h1) = (w.o.posit - r_com, w.h0.posit - r_com, w.h1.posit - r_com);
+            let (v_o, v_h0, v_h1) = (w.o.vel - v_com, w.h0.vel - v_com, w.h1.vel - v_com);
+            let l = r_o.cross(v_o) * m_o + r_h0.cross(v_h0) * m_h0 + r_h1.cross(v_h1) * m_h1;
+
+            // Inertia tensor about COM.
+            let inertia = |r: Vec3, mass: f32| {
+                let r2 = r.dot(r);
+                [
+                    [mass * (r2 - r.x * r.x), -mass * r.x * r.y, -mass * r.x * r.z],
+                    [-mass * r.y * r.x, mass * (r2 - r.y * r.y), -mass * r.y * r.z],
+                    [-mass * r.z * r.x, -mass * r.z * r.y, mass * (r2 - r.z * r.z)],
+                ]
+            };
+            let mut i_arr = inertia(r_o, m_o);
+            for add in [inertia(r_h0, m_h0), inertia(r_h1, m_h1)] {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        i_arr[i][j] += add[i][j];
+                    }
+                }
+            }
+            let i_mat = Mat3F32::from_arr(i_arr);
+            let omega = i_mat.solve_system(l); // ω = I⁻¹L
+
+            result += (m_total * v_com.magnitude_squared()) as f64; // M·V²
+            result += l.dot(omega) as f64; // L·ω = 2·(rotational KE)
         }
 
         // Add in the 0.5 factor, and convert from amu • (Å/ps)² to kcal/mol.
@@ -225,10 +267,16 @@ impl MdState {
         let num_constraints = {
             let mut c = 0;
 
+            // Both SHAKE and LINCS (`Linear`) constrain each H–heavy bond, so
+            // each H loses one DOF regardless of which solver is active. (The
+            // rattle projection in `kick_and_calc_accel` removes the bond
+            // velocity before the KE is measured, so counting the H as a full
+            // 3 DOF deflates the reported temperature ~1.19× on 2LYZ.)
             for atom in &self.atoms {
                 if matches!(
                     self.cfg.hydrogen_constraint,
                     HydrogenConstraint::Shake { shake_tolerance: _ }
+                        | HydrogenConstraint::Linear { .. }
                 ) && atom.element == Element::Hydrogen
                     && !atom.static_
                 {
