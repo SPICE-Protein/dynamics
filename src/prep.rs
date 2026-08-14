@@ -162,8 +162,34 @@ impl MdState {
         
         combined_atoms.append(&mut parent_ions);
 
-        // 2. Clone water molecules
-        let water = self.water.clone();
+        // 2. Clone water molecules, but prune any water molecule that clashes with the new mutant solute!
+        let mut water = Vec::new();
+        let cutoff_clash_sq = 2.2 * 2.2; // 2.2 Å cutoff for steric clashes
+        let mut pruned_count = 0;
+        
+        for w in &self.water {
+            let mut clash = false;
+            let o_pos = w.o.posit;
+            for a in &combined_atoms[..n_new_solute] { // only check against the new solute atoms
+                let diff = self.cell.min_image(o_pos - a.posit);
+                if diff.magnitude_squared() < cutoff_clash_sq {
+                    clash = true;
+                    break;
+                }
+            }
+            if clash {
+                pruned_count += 1;
+            } else {
+                water.push(w.clone());
+            }
+        }
+        
+        if pruned_count > 0 {
+            eprintln!(
+                "[solvent_reuse] Pruned {} clashing water molecule(s) near mutated residues.",
+                pruned_count
+            );
+        }
 
         // 3. Build combined mass_accel_factor
         let mut mass_accel_factor = Vec::with_capacity(combined_atoms.len());
