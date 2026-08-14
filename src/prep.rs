@@ -31,6 +31,7 @@ use bio_files::{
 };
 
 use crate::MdState;
+use crate::{ComputationDevice, AtomDynamics, ForceFieldParamsIndexed, LjTables, NeighborsNb};
 
 /// Add items from one parameter set to the other. If there are duplicates, the second set's overrides
 /// the baseline.
@@ -140,5 +141,71 @@ impl MdState {
         for p in &self.pairs_14_scaled {
             self.pairs_excluded_12_13.remove(p);
         }
+    }
+
+    /// Reuses the solvent box, water, and ions of this state but replaces the solute atoms
+    /// with the mutant solute atoms, rebuilding the force-field parameters and neighbor lists.
+    pub fn build_mutant_by_solvent_reuse(
+        &self,
+        dev: &ComputationDevice,
+        new_solute_atoms: Vec<AtomDynamics>,
+        new_solute_adjacency: Vec<Vec<usize>>,
+        new_ff_params: ForceFieldParamsIndexed,
+    ) -> Self {
+        let n_new_solute = new_solute_atoms.len();
+        
+        // 1. Combine new solute atoms with parent ions
+        let parent_solute_count = self.solute_atom_count;
+        let mut combined_atoms = new_solute_atoms;
+        let mut parent_ions = self.atoms[parent_solute_count..].to_vec();
+        
+        combined_atoms.append(&mut parent_ions);
+
+        // 2. Clone water molecules
+        let water = self.water.clone();
+
+        // 3. Build combined mass_accel_factor
+        let mut mass_accel_factor = Vec::with_capacity(combined_atoms.len());
+        for a in &combined_atoms {
+            mass_accel_factor.push(418.4 / a.mass);
+        }
+
+        // 4. Create new MdState
+        let mut new_state = Self {
+            cfg: self.cfg.clone(),
+            atoms: combined_atoms,
+            adjacency_list: new_solute_adjacency,
+            water,
+            cell: self.cell.clone(),
+            force_field_params: new_ff_params,
+            mass_accel_factor,
+            solute_atom_count: n_new_solute,
+            mol_start_indices: self.mol_start_indices.clone(),
+            ..Default::default()
+        };
+
+        // Rebuild mol_start_indices
+        let diff = n_new_solute as isize - parent_solute_count as isize;
+        let mut new_mol_start_indices = Vec::new();
+        if !self.mol_start_indices.is_empty() {
+            new_mol_start_indices.push(0); // Mol 0 is solute
+            for &idx in &self.mol_start_indices[1..] {
+                new_mol_start_indices.push((idx as isize + diff) as usize);
+            }
+        }
+        new_state.mol_start_indices = new_mol_start_indices;
+
+        // Populate other state parameters
+        new_state.potential_energy_between_mols = vec![0.0; new_state.mol_start_indices.len().pow(2)];
+        new_state.thermo_dof = new_state.dof_for_thermo();
+        new_state.water_pme_sites_forces = vec![[lin_alg::f64::Vec3::new_zero(); 3]; new_state.water.len()];
+        new_state.lj_tables = LjTables::new(&new_state.atoms);
+        new_state.neighbors_nb = NeighborsNb::new(new_state.cfg.neighbor_skin, new_state.cfg.coulomb_cutoff);
+
+        new_state.setup_nonbonded_exclusion_scale_flags();
+        new_state.build_all_neighbors(dev);
+        new_state.regen_pme(dev);
+
+        new_state
     }
 }

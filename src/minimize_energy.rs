@@ -63,13 +63,21 @@ impl MdState {
         max_iters: usize,
         external_force: Option<Vec<Vec3>>,
     ) {
-        println!("Minimizing energy...");
+        let pb = indicatif::ProgressBar::new(max_iters as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Minimizing energy...");
+
         let start = Instant::now();
 
-        let iters = self.minimize_lbfgs(dev, max_iters, &external_force);
+        let iters = self.minimize_lbfgs(dev, max_iters, &external_force, Some(&pb));
 
         let elapsed = start.elapsed().as_millis();
-        println!("Complete in {elapsed} ms. Used {iters} of {max_iters} iters");
+        pb.finish_with_message(format!("Complete in {elapsed} ms. Used {iters} of {max_iters} iters"));
     }
 
     /// L-BFGS energy minimization (ref: OpenMM `LocalEnergyMinimizer`, Nocedal & Wright).
@@ -86,6 +94,7 @@ impl MdState {
         dev: &ComputationDevice,
         max_iters: usize,
         external_force: &Option<Vec<Vec3>>,
+        pb: Option<&indicatif::ProgressBar>,
     ) -> usize {
         // L-BFGS / line-search constants (same values as OpenMM).
         const NUM_VECTORS: usize = 6;
@@ -239,6 +248,11 @@ impl MdState {
             x = x_new;
             grad = grad_new;
             energy = e_new;
+
+            if let Some(pbar) = pb {
+                pbar.set_position((it + 1) as u64);
+                pbar.set_message(format!("E: {:.1} kcal/mol, |g|: {:.1}", energy, norm(&grad)));
+            }
 
             if norm(&grad) <= tolerance {
                 break;

@@ -643,7 +643,7 @@ pub struct MdState {
     /// Note: We don't use bond structs once the simulation is set up; the adjacency list is the
     /// source of this.
     pub adjacency_list: Vec<Vec<usize>>,
-    pub(crate) force_field_params: ForceFieldParamsIndexed,
+    pub force_field_params: ForceFieldParamsIndexed,
     /// Current simulation time, in picoseconds.
     pub time: f64,
     pub step_count: usize, // increments.
@@ -717,7 +717,7 @@ pub struct MdState {
     thermo_dof: usize,
     /// Count of solute atoms stored at the front of `atoms`; any later atoms belong to
     /// explicit solvent molecules such as octanol or custom solvent templates.
-    solute_atom_count: usize,
+    pub solute_atom_count: usize,
     // todo: Deprecate this if you deprecate per-atom posits and vels in snapshots?
     /// Used to track which molecule each atom is associated with in our flattened structures.
     pub mol_start_indices: Vec<usize>,

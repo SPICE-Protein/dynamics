@@ -47,6 +47,7 @@ rand_distr = "0.6.0"
 itertools = "0.14.0" # For combinations when matching angles.
 
 rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
+indicatif = "0.17.8"
 
 #bincode = { version = "2.0.1", optional = true }
 bincode = "2.0.1"

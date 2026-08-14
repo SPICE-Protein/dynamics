@@ -263,6 +263,14 @@ fn add_water_site_force(f: &mut ForcesOnWaterMol, site: WaterSite, v: Vec3F64) {
     }
 }
 
+use std::cell::RefCell;
+
+thread_local! {
+    static CACHED_STD_FORCES: RefCell<Vec<Vec3F64>> = RefCell::new(Vec::new());
+    static CACHED_WAT_FORCES: RefCell<Vec<ForcesOnWaterMol>> = RefCell::new(Vec::new());
+    static CACHED_MOL_FORCES: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+}
+
 /// Applies non-bonded force in parallel (CPU thread-pool) over a set of atoms, with indices assigned
 /// upstream.
 ///
@@ -295,13 +303,25 @@ fn calc_force_cpu(
         .par_iter()
         .fold(
             || {
+                let mut f_std = CACHED_STD_FORCES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                let mut f_wat = CACHED_WAT_FORCES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                let mut f_mol = CACHED_MOL_FORCES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+
+                f_std.truncate(0);
+                f_std.resize(n_std, Vec3F64::new_zero());
+
+                f_wat.truncate(0);
+                f_wat.resize(n_wat, ForcesOnWaterMol::default());
+
+                f_mol.truncate(0);
+                f_mol.resize(n_mol * n_mol, 0.0_f64);
+
                 (
-                    // Sums as f64.
-                    vec![Vec3F64::new_zero(); n_std],
-                    vec![ForcesOnWaterMol::default(); n_wat],
+                    f_std,
+                    f_wat,
                     0.0_f64,                                       // Virial sum
                     0.0_f64,                                       // Energy sum
-                    vec![0.0_f64; mol_start_indices.len().pow(2)], // Per-pair
+                    f_mol,                                         // Per-pair
                     0.0_f64,                                       // Alchemical dH/dlambda
                 )
             },
@@ -482,6 +502,26 @@ fn calc_force_cpu(
                 for i in 0..em_a.len() {
                     em_a[i] += em_b[i];
                 }
+
+                // Recycle the db, wb, em_b vectors into thread-local caches
+                CACHED_STD_FORCES.with(|c| {
+                    let mut b = c.borrow_mut();
+                    if b.capacity() < db.capacity() {
+                        *b = db;
+                    }
+                });
+                CACHED_WAT_FORCES.with(|c| {
+                    let mut b = c.borrow_mut();
+                    if b.capacity() < wb.capacity() {
+                        *b = wb;
+                    }
+                });
+                CACHED_MOL_FORCES.with(|c| {
+                    let mut b = c.borrow_mut();
+                    if b.capacity() < em_b.capacity() {
+                        *b = em_b;
+                    }
+                });
 
                 // (f_on_std, f_on_water, virial_a + virial_b, e_a + e_b)
                 (
