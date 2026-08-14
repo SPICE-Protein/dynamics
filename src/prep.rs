@@ -31,7 +31,8 @@ use bio_files::{
 };
 
 use crate::MdState;
-use crate::{ComputationDevice, AtomDynamics, ForceFieldParamsIndexed, LjTables, NeighborsNb};
+use crate::{ComputationDevice, AtomDynamics, ForceFieldParamsIndexed, LjTables, NeighborsNb, insert_ion, remove_waters, CHARGE_UNIT_SCALER};
+use na_seq::Element;
 
 /// Add items from one parameter set to the other. If there are duplicates, the second set's overrides
 /// the baseline.
@@ -194,6 +195,39 @@ impl MdState {
             }
         }
         new_state.mol_start_indices = new_mol_start_indices;
+
+        // --- Wish 7: Re-neutralize based on mutant net charge ---
+        let q_scaled_sum: f32 = new_state.atoms.iter().map(|a| a.partial_charge).sum();
+        let net_q_e = q_scaled_sum / CHARGE_UNIT_SCALER;
+        let diff_q = net_q_e.round() as i32;
+
+        if diff_q != 0 {
+            let n_ions = diff_q.abs() as usize;
+            if n_ions > 0 && !new_state.water.is_empty() {
+                let (ff_type, elem, mass, q_scaled, sigma, eps): (&str, Element, f32, f32, f32, f32) =
+                    if diff_q > 0 {
+                        ("Cl-", Element::Chlorine, 35.45, -CHARGE_UNIT_SCALER, 4.478, 0.0073)
+                    } else {
+                        ("Na+", Element::Sodium, 22.99, CHARGE_UNIT_SCALER, 2.439, 0.1065)
+                    };
+
+                let stride = (new_state.water.len() / n_ions).max(1);
+                let w_indices: Vec<usize> = (0..n_ions)
+                    .map(|i| (i * stride).min(new_state.water.len() - 1))
+                    .collect();
+
+                for &w_idx in &w_indices {
+                    insert_ion(&mut new_state, w_idx, ff_type, elem, mass, q_scaled, sigma, eps);
+                }
+                
+                remove_waters(&mut new_state, w_indices);
+                
+                eprintln!(
+                    "[solvent_reuse] Re-neutralized mutant net charge ({:+.3}e) by adding {} {} ion(s).",
+                    net_q_e, n_ions, ff_type
+                );
+            }
+        }
 
         // Populate other state parameters
         new_state.potential_energy_between_mols = vec![0.0; new_state.mol_start_indices.len().pow(2)];

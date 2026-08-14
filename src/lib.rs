@@ -1647,7 +1647,7 @@ pub(crate) fn validate_mol_start_indices(
 /// Add one ion atom by displacing the water molecule at `w_idx` (does NOT remove the
 /// water; the caller must remove all displaced waters afterwards, in descending order).
 /// Joung–Cheatham parameters tuned for OPC water (Amber frcmod.ionsjc_opc).
-fn insert_ion(
+pub(crate) fn insert_ion(
     state: &mut MdState,
     w_idx: usize,
     ff_type: &str,
@@ -1694,7 +1694,7 @@ fn insert_ion(
 
 /// Remove displaced water molecules. Indices may be in any order; they are deduplicated
 /// and removed from highest to lowest to avoid index shifting.
-fn remove_waters(state: &mut MdState, mut w_indices: Vec<usize>) {
+pub(crate) fn remove_waters(state: &mut MdState, mut w_indices: Vec<usize>) {
     w_indices.sort_unstable_by(|a, b| b.cmp(a));
     w_indices.dedup();
     for idx in w_indices {
