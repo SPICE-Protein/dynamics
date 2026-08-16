@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bio_files::{AtomGeneric, ChainGeneric, ResidueGeneric};
+use bio_files::{AtomGeneric, ChainGeneric, ResidueGeneric, ResidueType};
 use na_seq::{
     AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes, Element,
 };
@@ -21,7 +21,7 @@ use crate::{
     add_hydrogens::{
         add_hydrogens_2::{Dihedral, aa_data_from_coords},
         bond_vecs::init_local_bond_vecs,
-        ph::{PKA_TYR, his_choice, standard_allowed_at_ph, variant_allowed_at_ph},
+        ph::{PKA_TYR, his_choice, standard_allowed_at_ph, variant_allowed_at_ph, resolve_his_tautomer_by_geometry},
     },
     params::{ProtFfChargeMap, ProtFfChargeMapSet},
 };
@@ -74,26 +74,63 @@ fn validate_h_atom_type(
 /// Helper to get the digit part of the H from what's expected in Amber's naming conventions.
 /// E.g. this might map an incrementing `0` and `1` to `2` and `3` for HE2 and HE3.
 fn make_h_digit_map(ff_map: &ProtFfChargeMap, ph: f32) -> DigitMap {
+    make_h_digit_map_custom(ff_map, ph, None)
+}
+
+pub(crate) fn make_h_digit_map_custom(
+    ff_map: &ProtFfChargeMap,
+    ph: f32,
+    custom_variant: Option<AminoAcidProtenationVariant>,
+) -> DigitMap {
     let mut result: DigitMap = HashMap::new();
 
     // Preselect a single HIS state at this pH so we don't mix HID/HIE/HIP digits.
-    let his_selected = his_choice(ph);
+    let his_selected = if let Some(v) = custom_variant {
+        if matches!(
+            v,
+            AminoAcidProtenationVariant::Hid
+                | AminoAcidProtenationVariant::Hie
+                | AminoAcidProtenationVariant::Hip
+        ) {
+            Some(v)
+        } else {
+            his_choice(ph)
+        }
+    } else {
+        his_choice(ph)
+    };
 
     for (&aa_gen, params) in ff_map {
-        // Filter by pH:
+        // Filter by pH/custom variant:
         let allowed = match aa_gen {
-            AminoAcidGeneral::Standard(aa) => standard_allowed_at_ph(aa, ph),
-            AminoAcidGeneral::Variant(v) => {
-                // Histidine: allow only the chosen tautomer at this pH
-                if matches!(
-                    v,
-                    AminoAcidProtenationVariant::Hid
-                        | AminoAcidProtenationVariant::Hie
-                        | AminoAcidProtenationVariant::Hip
-                ) {
-                    matches!(his_selected, Some(sel) if sel == v)
+            AminoAcidGeneral::Standard(aa) => {
+                if let Some(v) = custom_variant {
+                    match (aa, v) {
+                        (AminoAcid::Asp, AminoAcidProtenationVariant::Ash) => false,
+                        (AminoAcid::Glu, AminoAcidProtenationVariant::Glh) => false,
+                        (AminoAcid::Cys, AminoAcidProtenationVariant::Cym) => false,
+                        (AminoAcid::Lys, AminoAcidProtenationVariant::Lyn) => false,
+                        (AminoAcid::His, _) => false,
+                        _ => true,
+                    }
                 } else {
-                    variant_allowed_at_ph(v, ph)
+                    standard_allowed_at_ph(aa, ph)
+                }
+            }
+            AminoAcidGeneral::Variant(v) => {
+                if let Some(cv) = custom_variant {
+                    cv == v
+                } else {
+                    if matches!(
+                        v,
+                        AminoAcidProtenationVariant::Hid
+                            | AminoAcidProtenationVariant::Hie
+                            | AminoAcidProtenationVariant::Hip
+                    ) {
+                        matches!(his_selected, Some(sel) if sel == v)
+                    } else {
+                        variant_allowed_at_ph(v, ph)
+                    }
                 }
             }
         };
@@ -529,6 +566,7 @@ pub fn populate_hydrogens_dihedrals(
     chains: &mut [ChainGeneric],
     ff_map: &ProtFfChargeMapSet,
     ph: f32,
+    custom_protonation: Option<&HashMap<usize, AminoAcidProtenationVariant>>,
 ) -> Result<Vec<Dihedral>, ParamError> {
     // todo: Move this fn to this module? Split this and its diehdral component, or not?
 
@@ -596,6 +634,28 @@ pub fn populate_hydrogens_dihedrals(
             .filter_map(|i| index_map.get(i).map(|&idx| &atoms[idx]))
             .collect();
 
+        // Determine custom variant and geometry-based Histidine choice
+        let mut custom_variant = None;
+        let mut custom_variant_used = false;
+        if let Some(map) = custom_protonation {
+            if let Some(&var) = map.get(&res_i) {
+                custom_variant = Some(var);
+                custom_variant_used = true;
+            }
+        }
+
+        if !custom_variant_used && matches!(res.res_type, ResidueType::AminoAcid(AminoAcid::His)) {
+            let var = resolve_his_tautomer_by_geometry(atoms, res);
+            custom_variant = Some(var);
+            custom_variant_used = true;
+        }
+
+        let this_digit_map = if custom_variant_used {
+            make_h_digit_map_custom(&ff_map.internal, ph, custom_variant)
+        } else {
+            digit_map.clone()
+        };
+
         // todo: Handle the N term and C term cases; pass those params in.
         let (dihedral, h_added_this_res, this_cp_ca) = aa_data_from_coords(
             &atoms_this_res,
@@ -603,7 +663,7 @@ pub fn populate_hydrogens_dihedrals(
             &res.res_type,
             prev_cp_ca,
             n_next_pos,
-            &digit_map,
+            &this_digit_map,
             &disulfide_sg_sns,
         )?;
 

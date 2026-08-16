@@ -26,7 +26,8 @@
 // make_h_digit_map (e.g. extra arg) or cache a per-run his_selected before you call it.
 // That’s still a localized change.
 
-use na_seq::AminoAcidProtenationVariant;
+use bio_files::{AtomGeneric, ResidueGeneric};
+use na_seq::{AminoAcidProtenationVariant, AtomTypeInRes, Element};
 
 // Intrinsic pKas (typical, solvent-exposed). These are deliberately simple.
 // todo: Make them better?
@@ -37,6 +38,71 @@ const PKA_HIS: f32 = 6.0;
 const PKA_CYS: f32 = 8.3;
 const PKA_LYS: f32 = 10.5;
 pub(crate) const PKA_TYR: f32 = 10.5;
+
+pub(crate) fn resolve_his_tautomer_by_geometry(
+    atoms: &[AtomGeneric],
+    his_res: &ResidueGeneric,
+) -> AminoAcidProtenationVariant {
+    // 1. Locate ND1 and NE2 atoms of the His residue
+    let mut nd1_pos = None;
+    let mut ne2_pos = None;
+    for &sn in &his_res.atom_sns {
+        if let Some(atom) = atoms.iter().find(|a| a.serial_number == sn) {
+            if let Some(tir) = &atom.type_in_res {
+                if *tir == AtomTypeInRes::ND1 {
+                    nd1_pos = Some(atom.posit);
+                } else if *tir == AtomTypeInRes::NE2 {
+                    ne2_pos = Some(atom.posit);
+                }
+            }
+        }
+    }
+
+    let (Some(p_nd1), Some(p_ne2)) = (nd1_pos, ne2_pos) else {
+        return AminoAcidProtenationVariant::Hie;
+    };
+
+    // 2. Scan for hydrogen bond acceptors in all other residues
+    let mut min_d_nd1 = 999.0f64;
+    let mut min_d_ne2 = 999.0f64;
+
+    for atom in atoms {
+        if his_res.atom_sns.contains(&atom.serial_number) {
+            continue;
+        }
+
+        let is_acceptor = if let Some(tir) = &atom.type_in_res {
+            matches!(
+                tir,
+                AtomTypeInRes::O
+                    | AtomTypeInRes::OD1
+                    | AtomTypeInRes::OD2
+                    | AtomTypeInRes::OE1
+                    | AtomTypeInRes::OE2
+                    | AtomTypeInRes::OH
+            )
+        } else {
+            atom.element == Element::Oxygen || atom.element == Element::Nitrogen
+        };
+
+        if is_acceptor {
+            let d_nd1 = (atom.posit - p_nd1).magnitude() as f64;
+            let d_ne2 = (atom.posit - p_ne2).magnitude() as f64;
+            if d_nd1 < min_d_nd1 {
+                min_d_nd1 = d_nd1;
+            }
+            if d_ne2 < min_d_ne2 {
+                min_d_ne2 = d_ne2;
+            }
+        }
+    }
+
+    if min_d_nd1 < min_d_ne2 {
+        AminoAcidProtenationVariant::Hie
+    } else {
+        AminoAcidProtenationVariant::Hid
+    }
+}
 
 pub(crate) fn his_choice(ph: f32) -> Option<AminoAcidProtenationVariant> {
     // HIP (doubly protonated) below pKa; HIE (neutral, NE2-H tautomer) at or above.

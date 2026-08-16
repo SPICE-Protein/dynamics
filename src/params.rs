@@ -15,7 +15,7 @@ use bio_files::{
 };
 use na_seq::{AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes, Element};
 
-use crate::add_hydrogens::ph::{PKA_ASP, PKA_GLU};
+use crate::add_hydrogens::ph::{PKA_ASP, PKA_GLU, resolve_his_tautomer_by_geometry};
 use crate::{Dihedral, ParamError, merge_params, populate_hydrogens_dihedrals};
 
 pub type ProtFfChargeMap = HashMap<AminoAcidGeneral, Vec<ChargeParamsProtein>>;
@@ -229,6 +229,7 @@ pub fn populate_peptide_ff_and_q(
     ff_type_charge: &ProtFfChargeMapSet,
     disulfide_sg_sns: &std::collections::HashSet<u32>,
     ph: f32,
+    custom_protonation: Option<&HashMap<usize, AminoAcidProtenationVariant>>,
 ) -> Result<(), ParamError> {
     // Tis is slower than if we had an index map already.
     let mut index_map = HashMap::new();
@@ -236,7 +237,25 @@ pub fn populate_peptide_ff_and_q(
         index_map.insert(atom.serial_number, i);
     }
 
-    for res in residues {
+    for (res_i, res) in residues.iter().enumerate() {
+        // Resolve the protonation override or His tautomer at the residue level
+        // to avoid mutable/immutable borrowing conflicts on `atoms`.
+        let mut res_var_override = None;
+        if let Some(map) = custom_protonation {
+            if let Some(&var) = map.get(&res_i) {
+                res_var_override = Some(AminoAcidGeneral::Variant(var));
+            }
+        }
+
+        if res_var_override.is_none() {
+            if let ResidueType::AminoAcid(aa) = &res.res_type {
+                if *aa == AminoAcid::His {
+                    let var = resolve_his_tautomer_by_geometry(atoms, res);
+                    res_var_override = Some(AminoAcidGeneral::Variant(var));
+                }
+            }
+        }
+
         for sn in &res.atom_sns {
             let atom = match atoms.get_mut(index_map[sn]) {
                 Some(a) => a,
@@ -275,20 +294,24 @@ pub fn populate_peptide_ff_and_q(
             let aa_gen = if is_cyx {
                 AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Cyx)
             } else {
-                // Select the protonation variant consistent with the H-placement
-                // rules in add_hydrogens/ph.rs: below the acidic pKa, Asp/Glu are
-                // the protonated ASH/GLH forms, whose carboxylate O is typed "OH"
-                // and the added H "HO" (amino19.lib) — so the O–H bond resolves
-                // instead of the invalid O2–HB2 fallback that crashed low-pH
-                // builds (pH 0–4 → "Missing bond params for O2-HB2").
-                match *aa {
-                    AminoAcid::Asp if ph < PKA_ASP => {
-                        AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Ash)
+                if let Some(vo) = res_var_override.clone() {
+                    vo
+                } else {
+                    // Select the protonation variant consistent with the H-placement
+                    // rules in add_hydrogens/ph.rs: below the acidic pKa, Asp/Glu are
+                    // the protonated ASH/GLH forms, whose carboxylate O is typed "OH"
+                    // and the added H "HO" (amino19.lib) — so the O–H bond resolves
+                    // instead of the invalid O2–HB2 fallback that crashed low-pH
+                    // builds (pH 0–4 → "Missing bond params for O2-HB2").
+                    match *aa {
+                        AminoAcid::Asp if ph < PKA_ASP => {
+                            AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Ash)
+                        }
+                        AminoAcid::Glu if ph < PKA_GLU => {
+                            AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Glh)
+                        }
+                        _ => AminoAcidGeneral::Standard(*aa),
                     }
-                    AminoAcid::Glu if ph < PKA_GLU => {
-                        AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Glh)
-                    }
-                    _ => AminoAcidGeneral::Standard(*aa),
                 }
             };
 
@@ -451,7 +474,8 @@ pub fn prepare_peptide(
     residues: &mut Vec<ResidueGeneric>,
     chains: &mut [ChainGeneric],
     ff_map: &ProtFfChargeMapSet,
-    ph: f32, // todo: Implement.
+    ph: f32,
+    custom_protonation: Option<&HashMap<usize, AminoAcidProtenationVariant>>,
 ) -> Result<Vec<Dihedral>, ParamError> {
     let mut dihedrals = Vec::new();
 
@@ -460,13 +484,13 @@ pub fn prepare_peptide(
         .filter(|a| a.element == Element::Hydrogen)
         .count();
     if h_count < 10 {
-        dihedrals = populate_hydrogens_dihedrals(atoms, residues, chains, ff_map, ph)?;
+        dihedrals = populate_hydrogens_dihedrals(atoms, residues, chains, ff_map, ph, custom_protonation)?;
     }
 
     let disulfide_sg_sns = crate::add_hydrogens::find_disulfide_sgs(atoms);
 
     // todo: Similar checks for empty etc.
-    populate_peptide_ff_and_q(atoms, residues, ff_map, &disulfide_sg_sns, ph)?;
+    populate_peptide_ff_and_q(atoms, residues, ff_map, &disulfide_sg_sns, ph, custom_protonation)?;
 
     if bonds.is_empty() {
         *bonds = create_bonds(atoms);
@@ -617,7 +641,8 @@ fn find_incomplete_residues(mol: &MmCif) -> Vec<(String, u32, String)> {
 pub fn prepare_peptide_mmcif(
     mol: &mut MmCif,
     ff_map: &ProtFfChargeMapSet,
-    ph: f32, // todo: Implement.
+    ph: f32,
+    custom_protonation: Option<&HashMap<usize, AminoAcidProtenationVariant>>,
     strict_incomplete: bool,
 ) -> Result<(Vec<BondGeneric>, Vec<Dihedral>), ParamError> {
     let mut dihedrals = Vec::new();
@@ -692,6 +717,7 @@ pub fn prepare_peptide_mmcif(
             &mut mol.chains,
             ff_map,
             ph,
+            custom_protonation,
         )?;
     }
 
@@ -700,7 +726,7 @@ pub fn prepare_peptide_mmcif(
     let disulfide_sg_sns = crate::add_hydrogens::find_disulfide_sgs(&mol.atoms);
 
     // todo: Similar checks for empty etc.
-    populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map, &disulfide_sg_sns, ph)?;
+    populate_peptide_ff_and_q(&mut mol.atoms, &mol.residues, ff_map, &disulfide_sg_sns, ph, custom_protonation)?;
 
     let bonds = create_bonds(&mol.atoms);
     // Distance-based bond inference creates spurious cross-residue bonds in

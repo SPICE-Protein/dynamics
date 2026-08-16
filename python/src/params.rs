@@ -115,6 +115,7 @@ pub fn prepare_peptide(
         &mut chains_inner,
         &ff_map.inner,
         ph,
+        None,
     )
     .map_err(|e| PyErr::new::<PyValueError, _>(format!("{e:?}")))?;
 
@@ -153,7 +154,7 @@ pub fn prepare_peptide_mmcif(
     let mut mol_b = mol.borrow_mut();
 
     let (bonds, dihedrals) =
-        dynamics_rs::params::prepare_peptide_mmcif(&mut mol_b.inner, &ff_map.inner, ph)
+        dynamics_rs::params::prepare_peptide_mmcif(&mut mol_b.inner, &ff_map.inner, ph, None, true)
             .map_err(|e| PyErr::new::<PyValueError, _>(format!("{e:?}")))?;
 
     let bonds_out = bonds

@@ -148,6 +148,8 @@ fn main() {
         &mut protein,
         &param_set.peptide_ff_q_map.as_ref().unwrap(),
         7.0,
+        None,
+        true,
     )
     .unwrap();
 
