@@ -621,6 +621,14 @@ pub struct MdOverrides {
     pub snapshots_during_energy_min: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DistanceRestraint {
+    pub atom_0_idx: usize,
+    pub atom_1_idx: usize,
+    pub r0: f32, // target equilibrium distance (Å)
+    pub k: f32,  // force constant (kcal/mol/Å²)
+}
+
 #[derive(Default, Clone)]
 pub struct MdState {
     // todo: Update how we handle mode A/R.
@@ -644,6 +652,7 @@ pub struct MdState {
     /// source of this.
     pub adjacency_list: Vec<Vec<usize>>,
     pub force_field_params: ForceFieldParamsIndexed,
+    pub distance_restraints: Vec<DistanceRestraint>,
     /// Current simulation time, in picoseconds.
     pub time: f64,
     pub step_count: usize, // increments.

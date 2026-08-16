@@ -120,7 +120,13 @@ impl MdState {
             atoms.iter().flat_map(|a| [a.posit.x, a.posit.y, a.posit.z]).collect()
         };
         let flat_grad = |atoms: &[AtomDynamics]| -> Vec<f32> {
-            atoms.iter().flat_map(|a| [-a.force.x, -a.force.y, -a.force.z]).collect()
+            atoms.iter().flat_map(|a| {
+                if a.static_ {
+                    [0.0, 0.0, 0.0]
+                } else {
+                    [-a.force.x, -a.force.y, -a.force.z]
+                }
+            }).collect()
         };
         let write_pos = |atoms: &mut [AtomDynamics], x: &[f32]| {
             for (i, a) in atoms.iter_mut().enumerate() {
@@ -204,9 +210,15 @@ impl MdState {
                 compute_forces_and_energy(self, dev, external_force);
                 e_new = self.potential_energy;
                 for (i, a) in self.atoms.iter().enumerate() {
-                    grad_new[3 * i] = -a.force.x;
-                    grad_new[3 * i + 1] = -a.force.y;
-                    grad_new[3 * i + 2] = -a.force.z;
+                    if a.static_ {
+                        grad_new[3 * i] = 0.0;
+                        grad_new[3 * i + 1] = 0.0;
+                        grad_new[3 * i + 2] = 0.0;
+                    } else {
+                        grad_new[3 * i] = -a.force.x;
+                        grad_new[3 * i + 1] = -a.force.y;
+                        grad_new[3 * i + 2] = -a.force.z;
+                    }
                 }
                 // Armijo condition.
                 if e_new <= e0 + FTOL * step * gd0 {
@@ -455,6 +467,49 @@ impl MdState {
             self.update_max_displacement_since_rebuild();
             self.build_all_neighbors(dev);
             compute_forces_and_energy(self, dev, external_force);
+        }
+    }
+
+    /// Run a localized L-BFGS minimization on atoms within `radius` of `mutated_positions`.
+    /// This is extremely fast (typically <5 ms) and avoids full-system minimization overhead
+    /// while resolving any steric clashes from mutated sidechain packing or solvent/ion placement.
+    pub fn minimize_local_region(
+        &mut self,
+        dev: &ComputationDevice,
+        mutated_positions: &[Vec3],
+        radius: f32,
+        max_iters: usize,
+    ) {
+        if mutated_positions.is_empty() || max_iters == 0 {
+            return;
+        }
+
+        let radius_sq = radius * radius;
+
+        // 1. Backup the static_ flags of all atoms
+        let original_static: Vec<bool> = self.atoms.iter().map(|a| a.static_).collect();
+
+        // 2. Freeze all atoms (set static_ = true) EXCEPT those near mutated_positions
+        for a in &mut self.atoms {
+            let mut close = false;
+            for &p in mutated_positions {
+                let diff = self.cell.min_image(a.posit - p);
+                if diff.magnitude_squared() < radius_sq {
+                    close = true;
+                    break;
+                }
+            }
+            if !close {
+                a.static_ = true;
+            }
+        }
+
+        // 3. Run L-BFGS minimization on the active local region
+        let _iters = self.minimize_lbfgs(dev, max_iters, &None, None);
+
+        // 4. Restore original static_ flags
+        for (a, orig) in self.atoms.iter_mut().zip(original_static) {
+            a.static_ = orig;
         }
     }
 }

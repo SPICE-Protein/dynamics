@@ -25,6 +25,29 @@ impl MdState {
         self.apply_angle_bending_forces();
         self.apply_dihedral_forces(false);
         self.apply_dihedral_forces(true);
+        self.apply_distance_restraints();
+    }
+
+    pub(crate) fn apply_distance_restraints(&mut self) {
+        for restraint in &self.distance_restraints {
+            let (a_0, a_1) = split2_mut(&mut self.atoms, restraint.atom_0_idx, restraint.atom_1_idx);
+
+            let diff = self.cell.min_image(a_1.posit - a_0.posit);
+            let r = diff.magnitude();
+            if r < 1e-6 {
+                continue;
+            }
+            let dr = r - restraint.r0;
+            let force_mag = restraint.k * dr;
+            let f = diff * (force_mag / r);
+
+            a_0.force += f;
+            a_1.force -= f;
+
+            let energy = 0.5 * restraint.k * dr * dr;
+            self.potential_energy += energy as f64;
+            self.potential_energy_bonded += energy as f64;
+        }
     }
 
     pub(crate) fn apply_bond_stretching_forces(&mut self) {
