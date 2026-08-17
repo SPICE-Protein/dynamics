@@ -14,8 +14,15 @@ pub fn force_e_lj(dir: Vec3, inv_dist: f32, sigma: f32, eps: f32) -> (Vec3, f32)
 
     let mag = 24. * eps * 2.0f32.mul_add(sr12, -sr6) * inv_dist;
 
-    let energy = 4. * eps * (sr12 - sr6);
-    (dir * mag, energy)
+    let mut f = dir * mag;
+    const FORCE_CAP: f32 = 1e4;
+    let mag_f = f.magnitude();
+    if mag_f > FORCE_CAP {
+        f = f * (FORCE_CAP / mag_f);
+    }
+    // energy 同步限幅，防止累加爆炸
+    let energy = (4. * eps * (sr12 - sr6)).clamp(-1e6, 1e6);
+    (f, energy)
 }
 
 /// SIMD variant

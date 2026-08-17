@@ -750,6 +750,20 @@ impl MdState {
         mols: &[MolDynamics],
         param_set: &FfParamSet,
     ) -> Result<(Self, Vec<MolDynamics>), ParamError> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let mxcsr = std::arch::x86_64::_mm_getcsr();
+            // 同时开启 FTZ (bit 15) 和 DAZ (bit 6)
+            std::arch::x86_64::_mm_setcsr(mxcsr | (1 << 15) | (1 << 6));
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let mut fpcr: u64;
+            std::arch::asm!("mrs {}, fpcr", out(reg) fpcr);
+            fpcr |= 1 << 24; // FZ bit
+            std::arch::asm!("msr fpcr, {}", in(reg) fpcr);
+        }
+
         // We combine all molecule general and specific params into this set, then
         // create Indexed params from it.
         let mut params = ForceFieldParams::default();
