@@ -71,7 +71,7 @@ cuda_setup = { version = "0.1.9", optional = true }
 
 [patch.crates-io]
 # arm64 (Apple Silicon) fix: ewald's SIMD imports are gated on x86_64.
-ewald = { path = "../ewald" }
+ewald = { path = "https://github.com/SPICE-Protein/ewald.git" }
 
 
 [features]
@@ -89,4 +89,9 @@ vkfft = ["cuda", "ewald/vkfft"]
 encode = []
 
 train-bin = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+
 
