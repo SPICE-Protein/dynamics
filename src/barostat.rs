@@ -315,16 +315,27 @@ pub struct Barostat {
     pub rng: StdRng,
 }
 
+static SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn generate_unique_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let count = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SplitMix64 avalanche mixer: ensures that consecutive counts are mapped to completely
+    // uncorrelated seeds, even when nanos is identical across parallel threads/nodes.
+    let mut x = nanos.wrapping_add(count).wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
 impl Default for Barostat {
     fn default() -> Self {
         Self {
             virial: Default::default(),
-            rng: StdRng::seed_from_u64(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-            ),
+            rng: StdRng::seed_from_u64(generate_unique_seed()),
         }
     }
 }
@@ -336,12 +347,7 @@ impl Clone for Barostat {
     fn clone(&self) -> Self {
         Self {
             virial: self.virial.clone(),
-            rng: StdRng::seed_from_u64(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-            ),
+            rng: StdRng::seed_from_u64(generate_unique_seed()),
         }
     }
 }
