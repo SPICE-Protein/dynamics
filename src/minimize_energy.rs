@@ -142,6 +142,14 @@ impl MdState {
         let mut grad = flat_grad(&self.atoms);
         let mut energy = self.potential_energy;
         let mut used = 0;
+
+        // 2026-08-17 Safeguard: Skip L-BFGS if non-finite coordinates, forces, or energy are detected to prevent SIMD/PME SIGSEGV
+        if !x.iter().all(|val| val.is_finite()) || !grad.iter().all(|val| val.is_finite()) || !energy.is_finite() {
+            eprintln!("[solvent_reuse] [warn] Non-finite positions, forces, or energy detected at start of L-BFGS minimization. Skipping local minimization to let simulation-level force clamps/healers handle it.");
+            self.finish_minimize(dev);
+            return 0;
+        }
+
         if norm(&grad) <= tolerance {
             self.finish_minimize(dev);
             return used;
